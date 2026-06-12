@@ -1,0 +1,48 @@
+# Archivos de entrenamiento generados
+lumen_training/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Modelos grandes (no subir binarios)
+*.pt
+*.pth
+*.safetensors
+*.gguf
+*.tflite
+*.bin
+*.onnx
+
+# Tokenizador entrenado
+*.model
+*.vocab
+
+# Logs
+*.log
