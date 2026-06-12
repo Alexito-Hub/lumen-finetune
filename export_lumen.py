@@ -245,9 +245,9 @@ def main():
 
     # 2. Guardar pesos en formato SafeTensors (.safetensors)
     try:
-        from safetensors.torch import save_file
+        from safetensors.torch import save_model
         st_path = out_dir / "lumen_model.safetensors"
-        save_file(state_dict, str(st_path))
+        save_model(model, str(st_path))
         print(f"[OK] SafeTensors exportado a: {st_path} ({st_path.stat().st_size / 1e6:.2f} MB)")
     except ImportError:
         print("[WARN] Biblioteca 'safetensors' no instalada. Omitiendo conversión a safetensors.")

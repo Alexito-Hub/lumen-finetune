@@ -1637,9 +1637,9 @@ def export_model(model, tokenizer):
         shutil.copy2(sp_vocab, cfg.FINAL_MODEL_DIR / "tokenizer.vocab")
 
     try:
-        from safetensors.torch import save_file
+        from safetensors.torch import save_model
         st_path = cfg.FINAL_MODEL_DIR / "lumen_model.safetensors"
-        save_file(model.state_dict(), str(st_path))
+        save_model(model, str(st_path))
         st_mb = st_path.stat().st_size / 1e6
         print(f"  [OK] SafeTensors: {st_path} ({st_mb:.1f} MB)")
     except ImportError:
