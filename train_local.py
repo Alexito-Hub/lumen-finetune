@@ -18,7 +18,9 @@ import sentencepiece as spm
 
 print(f"PyTorch {torch.__version__}")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device: {DEVICE}")
+torch.set_num_threads(24)           # usar todos los CPUs
+torch.set_num_interop_threads(4)
+print(f"Device: {DEVICE} | Threads: {torch.get_num_threads()}")
 
 # ─── Configuración ────────────────────────────────────────────────────────────
 
@@ -29,15 +31,15 @@ class Config:
     CHECKPOINT_DIR   = WORK_DIR / "checkpoints"
     FINAL_MODEL_DIR  = WORK_DIR / "lumen_final"
 
-    # Corpus — reducido para CPU
-    N_WIKIPEDIA_DOCS  = 0       # 0 = sin Wikipedia (muy lento en CPU)
-    KB_REPEAT         = 40
-    DIALOG_REPEAT     = 40
-    PARAPHRASE_FACTOR = 5
+    # Corpus — Wikipedia activada para corpus grande
+    N_WIKIPEDIA_DOCS  = 8_000   # ~320 MB texto espanol
+    KB_REPEAT         = 80
+    DIALOG_REPEAT     = 80
+    PARAPHRASE_FACTOR = 6
 
-    # Tokenizador — reducido para corpus local
-    VOCAB_SIZE        = 3_500
-    MAX_SENTENCEPIECE = 200_000
+    # Tokenizador — debe coincidir con el modelo existente (vocab=12000)
+    VOCAB_SIZE        = 12_000
+    MAX_SENTENCEPIECE = 500_000
 
     # Modelo — igual que Colab para que sea compatible
     D_MODEL    = 512
@@ -47,16 +49,16 @@ class Config:
     MAX_SEQ_LEN = 512
     DROPOUT    = 0.1
 
-    # Entrenamiento — ajustado para CPU
-    BATCH_SIZE       = 4
-    GRAD_ACCUM_STEPS = 8        # batch efectivo = 32
+    # Entrenamiento — maximizado para 17 GB RAM / 24 CPUs
+    BATCH_SIZE       = 48       # usa ~8 GB RAM
+    GRAD_ACCUM_STEPS = 2        # batch efectivo = 96
     LEARNING_RATE    = 3e-4
     WEIGHT_DECAY     = 0.1
-    WARMUP_STEPS     = 200
-    MAX_STEPS        = 5_000    # ~1-2 horas en CPU; sube a 20k si tienes tiempo
-    LOG_EVERY        = 50
-    SAVE_EVERY       = 500
-    EVAL_EVERY       = 500
+    WARMUP_STEPS     = 500
+    MAX_STEPS        = 30_000
+    LOG_EVERY        = 100
+    SAVE_EVERY       = 2_000
+    EVAL_EVERY       = 2_000
 
     GEN_MAX_TOKENS  = 150
     GEN_TEMPERATURE = 0.7
@@ -624,11 +626,12 @@ class LumenDataset(Dataset):
         all_ids = [BOS_ID] + tokenizer.encode(text) + [EOS_ID]
         print(f"[OK] Corpus tokenizado: {len(all_ids):,} tokens")
         self.sequences = []
-        for i in range(0, len(all_ids) - seq_len, seq_len):
+        stride = seq_len // 2  # solapamiento 50% → más secuencias de entrenamiento
+        for i in range(0, len(all_ids) - seq_len, stride):
             chunk = all_ids[i:i + seq_len + 1]
             if len(chunk) == seq_len + 1:
                 self.sequences.append(chunk)
-        print(f"[OK] Secuencias: {len(self.sequences):,} (largo={seq_len})\n")
+        print(f"[OK] Secuencias: {len(self.sequences):,} (largo={seq_len}, stride={stride})\n")
 
     def __len__(self): return len(self.sequences)
 
@@ -833,8 +836,17 @@ def export_model(model, tokenizer):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    corpus = build_corpus()
-    tokenizer = train_tokenizer(corpus)
+    # Reutiliza tokenizador existente si ya fue entrenado (evita vocab mismatch)
+    sp_model_path = Path(str(cfg.TOKENIZER_PREFIX) + ".model")
+    if sp_model_path.exists():
+        print(f"[OK] Tokenizador existente: {sp_model_path}")
+        tokenizer = spm.SentencePieceProcessor()
+        tokenizer.load(str(sp_model_path))
+        print(f"[OK] Tokenizador cargado: {tokenizer.get_piece_size()} tokens")
+        corpus = cfg.CORPUS_FILE.read_text(encoding="utf-8") if cfg.CORPUS_FILE.exists() else build_corpus()
+    else:
+        corpus = build_corpus()
+        tokenizer = train_tokenizer(corpus)
 
     PAD_ID   = tokenizer.piece_to_id(TOK_PAD)
     BOS_ID   = tokenizer.piece_to_id(TOK_BOS)
@@ -843,7 +855,9 @@ if __name__ == "__main__":
 
     dataset = LumenDataset(cfg.CORPUS_FILE, tokenizer, cfg.MAX_SEQ_LEN)
     dataloader = DataLoader(dataset, batch_size=cfg.BATCH_SIZE,
-                            shuffle=True, num_workers=0, drop_last=True)
+                            shuffle=True, num_workers=4,
+                            pin_memory=False, drop_last=True,
+                            persistent_workers=True)
     print(f"[OK] DataLoader: {len(dataloader):,} batches\n")
 
     model = LumenModel(
