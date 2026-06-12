@@ -25,7 +25,7 @@ print(f"Device: {DEVICE} | Threads: {torch.get_num_threads()}")
 # ─── Configuración ────────────────────────────────────────────────────────────
 
 class Config:
-    WORK_DIR         = Path("./lumen_training")
+    WORK_DIR         = Path(__file__).parent.parent / "lumen_training"
     CORPUS_FILE      = WORK_DIR / "corpus.txt"
     TOKENIZER_PREFIX = WORK_DIR / "lumen_tokenizer"
     CHECKPOINT_DIR   = WORK_DIR / "checkpoints"
@@ -860,8 +860,18 @@ if __name__ == "__main__":
                             persistent_workers=True)
     print(f"[OK] DataLoader: {len(dataloader):,} batches\n")
 
+    # Si hay checkpoint, leer vocab_size del checkpoint para evitar size mismatch
+    ckpts = sorted(cfg.CHECKPOINT_DIR.glob("lumen_step_*.pt"))
+    if ckpts:
+        _ck = torch.load(ckpts[-1], map_location="cpu", weights_only=False)
+        vocab_size = _ck["model_state_dict"]["token_emb.weight"].shape[0]
+        print(f"[OK] vocab_size del checkpoint: {vocab_size}")
+        del _ck
+    else:
+        vocab_size = tokenizer.get_piece_size()
+
     model = LumenModel(
-        vocab_size=tokenizer.get_piece_size(),
+        vocab_size=vocab_size,
         d_model=cfg.D_MODEL, n_heads=cfg.N_HEADS,
         n_layers=cfg.N_LAYERS, d_ff=cfg.D_FF,
         max_seq_len=cfg.MAX_SEQ_LEN, dropout=cfg.DROPOUT,

@@ -39,6 +39,7 @@ desktop.ini
 *.tflite
 *.bin
 *.onnx
+*.exe
 
 # Tokenizador entrenado
 *.model
