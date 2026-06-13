@@ -22,7 +22,6 @@ import torch
 import torch.nn as nn
 import sentencepiece as spm
 
-# Re-declaración de la arquitectura para poder cargar el estado
 class Config:
     D_MODEL           = 512
     N_HEADS           = 8
@@ -30,7 +29,6 @@ class Config:
     D_FF              = 2048
     MAX_SEQ_LEN       = 512
 
-# Tokens especiales
 TOK_USER  = "<|user|>"
 TOK_LUMEN = "<|lumen|>"
 TOK_END   = "<|end|>"
@@ -85,16 +83,15 @@ class MultiHeadAttention(nn.Module):
         q = apply_rope(q, cos_freqs, sin_freqs)
         k = apply_rope(k, cos_freqs, sin_freqs)
         scale = math.sqrt(self.head_dim)
-        
-        # Atención
+
         attn = torch.matmul(q, k.transpose(-2, -1)) / scale
         if mask is not None:
             attn = attn.masked_fill(mask == 0, float('-inf'))
-        
+
         import torch.nn.functional as F
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
-        
+
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.wo(out)
@@ -221,12 +218,11 @@ def main():
 
     print(f"[INFO] Cargando pesos del checkpoint...")
     checkpoint = torch.load(ckpt_path, map_location="cpu")
-    
-    # Manejar formatos de guardado (diccionario completo de checkpoint o solo state dict)
+
     state_dict = checkpoint
     step = "desconocido"
     loss = "desconocido"
-    
+
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
         step = checkpoint.get("step", "desconocido")
@@ -238,12 +234,10 @@ def main():
     model.load_state_dict(state_dict)
     model.eval()
 
-    # 1. Guardar pesos PyTorch crudos (.pt)
     pt_path = out_dir / "lumen_model.pt"
     torch.save(state_dict, pt_path)
     print(f"[OK] Pesos PyTorch exportados a: {pt_path} ({pt_path.stat().st_size / 1e6:.2f} MB)")
 
-    # 2. Guardar pesos en formato SafeTensors (.safetensors)
     try:
         from safetensors.torch import save_model
         st_path = out_dir / "lumen_model.safetensors"
@@ -252,7 +246,6 @@ def main():
     except ImportError:
         print("[WARN] Biblioteca 'safetensors' no instalada. Omitiendo conversión a safetensors.")
 
-    # 3. Guardar archivo config.json
     config = {
         "model_name": "Lumen",
         "creator": "Alessandro Villogas Gaspar",
@@ -274,18 +267,16 @@ def main():
             "end": TOK_END
         }
     }
-    
+
     config_path = out_dir / "config.json"
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
     print(f"[OK] Configuración exportada a: {config_path}")
 
-    # 4. Copiar archivos del tokenizador
     import shutil
     shutil.copy2(tok_path, out_dir / "tokenizer.model")
     print(f"[OK] Tokenizador copiado a: {out_dir / 'tokenizer.model'}")
-    
-    # Si hay vocabulario, copiarlo también
+
     vocab_path = tok_path.with_suffix(".vocab")
     if vocab_path.exists():
         shutil.copy2(vocab_path, out_dir / "tokenizer.vocab")

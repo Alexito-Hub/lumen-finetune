@@ -720,7 +720,8 @@ def train(model, tokenizer, dataloader):
     last_t = t0
 
     # Resume si existe checkpoint
-    ckpts = sorted(cfg.CHECKPOINT_DIR.glob("lumen_step_*.pt"))
+    ckpts = sorted(cfg.CHECKPOINT_DIR.glob("lumen_step_*.pt"),
+                    key=lambda p: int(p.stem.split("_")[-1]))
     if ckpts:
         ck = torch.load(ckpts[-1], map_location=DEVICE)
         model.load_state_dict(ck["model_state_dict"])
@@ -861,7 +862,8 @@ if __name__ == "__main__":
     print(f"[OK] DataLoader: {len(dataloader):,} batches\n")
 
     # Si hay checkpoint, leer vocab_size del checkpoint para evitar size mismatch
-    ckpts = sorted(cfg.CHECKPOINT_DIR.glob("lumen_step_*.pt"))
+    ckpts = sorted(cfg.CHECKPOINT_DIR.glob("lumen_step_*.pt"),
+                    key=lambda p: int(p.stem.split("_")[-1]))
     if ckpts:
         _ck = torch.load(ckpts[-1], map_location="cpu", weights_only=False)
         vocab_size = _ck["model_state_dict"]["token_emb.weight"].shape[0]

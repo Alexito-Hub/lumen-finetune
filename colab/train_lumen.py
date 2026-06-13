@@ -1,15 +1,15 @@
 """
 
               LUMEN — Entrenamiento desde cero en Google Colab       
-                                                                      
+
   Modelo:  Lumen (asistente IA on-device para Nexo / UPLA)           
   Autor:   Alessandro Villogas Gaspar — Auralix Studio               
   Fecha:   Junio 2026                                                 
-                                                                      
+
   Este script entrena un modelo de lenguaje tipo GPT desde cero       
   (pesos aleatorios) para que funcione como asistente de la UPLA      
   dentro de la aplicación Nexo.                                       
-                                                                      
+
    Cómo usar en Google Colab                                      
   1. Subir este archivo a Colab o copiar celda por celda              
   2. Cambiar Runtime -> GPU (T4 o mejor)                               
@@ -57,30 +57,30 @@ class Config:
     GDRIVE_MOUNT      = Path("/content/drive")
     GDRIVE_SAVE_DIR   = GDRIVE_MOUNT / "MyDrive" / "lumen_models"
 
-    N_WIKIPEDIA_DOCS  = 20_000     # artículos de Wikipedia ES
-    KB_REPEAT         = 25         # veces que se repite la KB UPLA
-    DIALOG_REPEAT     = 25         # veces que se repiten los diálogos
-    PARAPHRASE_FACTOR = 4          # variantes por pregunta UPLA
+    N_WIKIPEDIA_DOCS  = 20_000                                
+    KB_REPEAT         = 25                                         
+    DIALOG_REPEAT     = 25                                            
+    PARAPHRASE_FACTOR = 4                                       
 
     VOCAB_SIZE         = 12_000
-    MAX_SENTENCEPIECE  = 300_000   # líneas para entrenar SP
+    MAX_SENTENCEPIECE  = 300_000                            
 
-    D_MODEL           = 512        # dimensión de embedding
-    N_HEADS           = 8          # cabezas de atención
-    N_LAYERS          = 8          # capas transformer
-    D_FF              = 2048       # dimensión FFN (4 * d_model)
-    MAX_SEQ_LEN       = 512        # longitud máxima de secuencia
+    D_MODEL           = 512                                
+    N_HEADS           = 8                               
+    N_LAYERS          = 8                             
+    D_FF              = 2048                                    
+    MAX_SEQ_LEN       = 512                                      
     DROPOUT           = 0.1
 
     BATCH_SIZE         = 16
-    GRAD_ACCUM_STEPS   = 4         # batch efectivo = 16*4 = 64
+    GRAD_ACCUM_STEPS   = 4                                     
     LEARNING_RATE      = 3e-4
     WEIGHT_DECAY       = 0.1
     WARMUP_STEPS       = 500
-    MAX_STEPS          = 50_000    # pasos totales de entrenamiento
-    LOG_EVERY          = 100       # cada cuántos pasos loguear
-    SAVE_EVERY         = 2_500     # cada cuántos pasos guardar checkpoint
-    EVAL_EVERY         = 2_500     # cada cuántos pasos evaluar con prompts
+    MAX_STEPS          = 50_000                                    
+    LOG_EVERY          = 100                                   
+    SAVE_EVERY         = 2_500                                            
+    EVAL_EVERY         = 2_500                                             
 
     GEN_MAX_TOKENS     = 256
     GEN_TEMPERATURE    = 0.7
@@ -88,7 +88,6 @@ class Config:
     GEN_TOP_P          = 0.9
 
     SEED = 1983
-
 
 cfg = Config()
 
@@ -900,7 +899,6 @@ PARAPHRASE_PREFIX = [
     "Tengo una duda, ", "Oye Lumen, ", "Me puedes decir, ",
 ]
 
-
 def paraphrase(turns: list, factor: int) -> list:
     """Genera variantes con prefijos para cada diálogo."""
     out = []
@@ -914,7 +912,6 @@ def paraphrase(turns: list, factor: int) -> list:
             else:
                 out.append(t)
     return out
-
 
 def load_spanish_base(n_docs: int) -> list:
     """Descarga artículos de Wikipedia en español para base lingüística."""
@@ -940,7 +937,6 @@ def load_spanish_base(n_docs: int) -> list:
             print(f"  … {i+1:,} artículos procesados")
     print(f"[OK] Español base: {len(docs):,} documentos cargados")
     return docs
-
 
 def build_corpus() -> str:
     """Construye el corpus completo de entrenamiento."""
@@ -982,7 +978,6 @@ def build_corpus() -> str:
     print(f"{'' * 50}\n")
     return corpus
 
-
 corpus_text = build_corpus()
 
 def train_tokenizer(corpus: str):
@@ -1008,9 +1003,9 @@ def train_tokenizer(corpus: str):
         model_type="bpe",
         character_coverage=0.9995,
         num_threads=os.cpu_count() or 4,
-        pad_id=0,         # [PAD]
-        bos_id=1,         # [BOS]
-        eos_id=2,         # [EOS]
+        pad_id=0,                
+        bos_id=1,                
+        eos_id=2,                
         unk_id=3,
         user_defined_symbols=user_defined,
         byte_fallback=True,
@@ -1040,7 +1035,6 @@ def train_tokenizer(corpus: str):
     sp_input.unlink(missing_ok=True)
 
     return sp
-
 
 tokenizer = train_tokenizer(corpus_text)
 
@@ -1087,7 +1081,6 @@ class LumenDataset(Dataset):
         y = torch.tensor(seq[1:], dtype=torch.long)
         return x, y
 
-
 dataset = LumenDataset(cfg.CORPUS_FILE, tokenizer, cfg.MAX_SEQ_LEN)
 dataloader = DataLoader(
     dataset,
@@ -1114,7 +1107,6 @@ class RMSNorm(nn.Module):
         rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
         return x / rms * self.weight
 
-
 def precompute_rope_freqs(dim: int, max_seq_len: int, theta: float = 10000.0):
     """Pre-computa las frecuencias para Rotary Position Embeddings."""
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
@@ -1134,7 +1126,6 @@ def apply_rope(x, cos_freqs, sin_freqs):
     out1 = x1 * cos_f - x2 * sin_f
     out2 = x2 * cos_f + x1 * sin_f
     return torch.cat([out1, out2], dim=-1)
-
 
 class MultiHeadAttention(nn.Module):
     """Multi-Head Self-Attention con RoPE y máscara causal."""
@@ -1174,7 +1165,6 @@ class MultiHeadAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.wo(out)
 
-
 class SwiGLU(nn.Module):
     """SwiGLU activation (usado en LLaMA, Gemma, etc)."""
 
@@ -1188,7 +1178,6 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
-
 class TransformerBlock(nn.Module):
     """Un bloque Transformer con Pre-Norm (RMSNorm -> Atención -> RMSNorm -> FFN)."""
 
@@ -1200,11 +1189,10 @@ class TransformerBlock(nn.Module):
         self.ffn = SwiGLU(d_model, d_ff, dropout)
 
     def forward(self, x, cos_freqs, sin_freqs, mask=None):
-        # Pre-norm residual
+
         x = x + self.attn(self.attn_norm(x), cos_freqs, sin_freqs, mask)
         x = x + self.ffn(self.ffn_norm(x))
         return x
-
 
 class LumenModel(nn.Module):
     """
@@ -1294,7 +1282,6 @@ class LumenModel(nn.Module):
 
         return logits, loss
 
-
 model = LumenModel(
     vocab_size=tokenizer.get_piece_size(),
     d_model=cfg.D_MODEL,
@@ -1313,7 +1300,6 @@ def get_lr(step: int, warmup: int, max_steps: int, max_lr: float, min_lr: float 
         return min_lr
     progress = (step - warmup) / (max_steps - warmup)
     return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
-
 
 decay_params = []
 no_decay_params = []
@@ -1385,7 +1371,6 @@ def generate(
     output_ids = output_ids[len(ids):]
     return tokenizer.decode(output_ids)
 
-
 EVAL_PROMPTS = [
     f"{TOK_USER} ¿Quién eres? {TOK_LUMEN}",
     f"{TOK_USER} ¿Qué es la UPLA? {TOK_LUMEN}",
@@ -1398,7 +1383,6 @@ EVAL_PROMPTS = [
     f"{TOK_USER} ¿Qué es Auralix Studio? {TOK_LUMEN}",
     f"{TOK_USER} ¿Cuánto dura Ingeniería de Sistemas? {TOK_LUMEN}",
 ]
-
 
 def run_evaluation(model, tokenizer, step: int):
     """Ejecuta la batería de prompts de evaluación."""
@@ -1457,7 +1441,6 @@ def load_checkpoint(path, model, optimizer=None, scaler=None):
     print(f"   Checkpoint cargado: {path} (step {checkpoint['step']:,})")
     return checkpoint["step"], checkpoint.get("loss", float("inf"))
 
-
 def train():
     """Loop principal de entrenamiento."""
     print("\n" + "" * 60)
@@ -1478,10 +1461,12 @@ def train():
     last_log_time = start_time
     last_tokens = 0
 
-    existing_ckpts = sorted(cfg.CHECKPOINT_DIR.glob("lumen_step_*.pt"))
-    
+    existing_ckpts = sorted(cfg.CHECKPOINT_DIR.glob("lumen_step_*.pt"),
+                            key=lambda p: int(p.stem.split("_")[-1]))
+
     if not existing_ckpts and USING_GDRIVE:
-        gdrive_ckpts = sorted(cfg.GDRIVE_SAVE_DIR.glob("lumen_step_*.pt"))
+        gdrive_ckpts = sorted(cfg.GDRIVE_SAVE_DIR.glob("lumen_step_*.pt"),
+                              key=lambda p: int(p.stem.split("_")[-1]))
         if gdrive_ckpts:
             latest_gdrive = gdrive_ckpts[-1]
             local_ckpt_path = cfg.CHECKPOINT_DIR / latest_gdrive.name
@@ -1533,7 +1518,7 @@ def train():
                     current_time = time.time()
                     step_time = (current_time - last_log_time) / cfg.LOG_EVERY
                     tok_per_sec = (tokens_processed - last_tokens) / (current_time - last_log_time)
-                    
+
                     eta_seconds = (cfg.MAX_STEPS - global_step) * step_time
                     eta_hours = eta_seconds / 3600
 
@@ -1578,7 +1563,6 @@ def train():
     print("" * 60 + "\n")
 
     return model
-
 
 trained_model = train()
 
@@ -1687,7 +1671,6 @@ def export_model(model, tokenizer):
     print(f"  $ pip install ai-edge-torch")
     print(f"  $ python convert_to_tflite.py --model lumen_final/")
     print()
-
 
 export_model(trained_model, tokenizer)
 
