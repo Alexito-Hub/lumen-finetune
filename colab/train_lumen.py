@@ -1,33 +1,48 @@
 """
+              LUMEN - Entrenamiento v2.0 (Google Colab)
 
-              LUMEN — Entrenamiento desde cero en Google Colab       
+  Modelo:  Lumen - asistente IA on-device para Nexo / UPLA
+  Autor:   Alessandro Villogas Gaspar - Auralix Studio
+  Fecha:   Junio 2026
 
-  Modelo:  Lumen (asistente IA on-device para Nexo / UPLA)           
-  Autor:   Alessandro Villogas Gaspar — Auralix Studio               
-  Fecha:   Junio 2026                                                 
+  Mejoras v2.0
+  1. TOKENS DE FUNCION  [CALL:X] / [RESULT]
+     El modelo aprende cuando pedir datos del estudiante.
+     El runtime de Nexo intercepta [CALL:X] e inyecta el
+     resultado real. El modelo completa la respuesta.
 
-  Este script entrena un modelo de lenguaje tipo GPT desde cero       
-  (pesos aleatorios) para que funcione como asistente de la UPLA      
-  dentro de la aplicación Nexo.                                       
+  2. MODO THINKING  [THINK] ... [/THINK]
+     Para calculos complejos el modelo emite un razonamiento
+     breve antes de la respuesta. Mejora aritmetica y la
+     deteccion de intencion.
 
-   Cómo usar en Google Colab                                      
-  1. Subir este archivo a Colab o copiar celda por celda              
-  2. Cambiar Runtime -> GPU (T4 o mejor)                               
-  3. Ejecutar todo secuencialmente                                    
-  4. El modelo se guarda en Google Drive al final                     
+  3. LOSS SOLO SOBRE RESPUESTAS DE LUMEN (response mask)
+     No se propagan gradientes sobre la pregunta del usuario.
+     El modelo aprende a responder, no a memorizar preguntas.
 
+  4. LABEL SMOOTHING (0.1)
+     Regulariza el vocabulario pequeno. Mejora generalizacion.
+
+  5. ESPANOL + UPLA PRIMERO
+     Wikipedia reducida a 3000 docs.
+     KB UPLA/Nexo/Lumen repetida 40 veces.
+
+  6. CORPUS EXPANDIDO
+     +40 dialogos de function-call
+     +30 dialogos con thinking
+     +25 dialogos de clarificacion
 """
 
 import subprocess, sys
 
-def install(pkg):
+def install(pkg: str) -> None:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
 install("sentencepiece")
 install("datasets")
 install("safetensors")
 
-import os, math, json, time, random, textwrap, io
+import os, math, json, time, random
 from pathlib import Path
 from typing import Optional
 
@@ -43,57 +58,65 @@ print(f"PyTorch {torch.__version__}")
 print(f"CUDA disponible: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Memoria GPU: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB") 
+    print(f"Memoria GPU: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
 
 class Config:
-    """Configuración centralizada del entrenamiento."""
+    """Hiperparametros y directorios centralizados."""
 
-    WORK_DIR          = Path("./lumen_training")
-    CORPUS_FILE       = WORK_DIR / "corpus.txt"
-    TOKENIZER_PREFIX  = WORK_DIR / "lumen_tokenizer"
-    CHECKPOINT_DIR    = WORK_DIR / "checkpoints"
-    FINAL_MODEL_DIR   = WORK_DIR / "lumen_final"
+    WORK_DIR         = Path("./lumen_training")
+    CORPUS_FILE      = WORK_DIR / "corpus.txt"
+    TOKENIZER_PREFIX = WORK_DIR / "lumen_tokenizer"
+    CHECKPOINT_DIR   = WORK_DIR / "checkpoints"
+    FINAL_MODEL_DIR  = WORK_DIR / "lumen_final"
 
-    GDRIVE_MOUNT      = Path("/content/drive")
-    GDRIVE_SAVE_DIR   = GDRIVE_MOUNT / "MyDrive" / "lumen_models"
+    GDRIVE_MOUNT     = Path("/content/drive")
+    GDRIVE_SAVE_DIR  = GDRIVE_MOUNT / "MyDrive" / "lumen_models"
 
-    N_WIKIPEDIA_DOCS  = 20_000                                
-    KB_REPEAT         = 25                                         
-    DIALOG_REPEAT     = 25                                            
-    PARAPHRASE_FACTOR = 4                                       
+    # Corpus - UPLA tiene prioridad absoluta sobre Wikipedia
+    N_WIKIPEDIA_DOCS  = 3_000
+    KB_REPEAT         = 40
+    DIALOG_REPEAT     = 40
+    PARAPHRASE_FACTOR = 5
 
-    VOCAB_SIZE         = 12_000
-    MAX_SENTENCEPIECE  = 300_000                            
+    # Tokenizador
+    VOCAB_SIZE        = 12_000
+    MAX_SENTENCEPIECE = 300_000
 
-    D_MODEL           = 512                                
-    N_HEADS           = 8                               
-    N_LAYERS          = 8                             
-    D_FF              = 2048                                    
-    MAX_SEQ_LEN       = 512                                      
-    DROPOUT           = 0.1
+    # Arquitectura
+    D_MODEL     = 512
+    N_HEADS     = 8
+    N_LAYERS    = 8
+    D_FF        = 2048
+    MAX_SEQ_LEN = 512
+    DROPOUT     = 0.1
 
-    BATCH_SIZE         = 16
-    GRAD_ACCUM_STEPS   = 4                                     
-    LEARNING_RATE      = 3e-4
-    WEIGHT_DECAY       = 0.1
-    WARMUP_STEPS       = 500
-    MAX_STEPS          = 50_000                                    
-    LOG_EVERY          = 100                                   
-    SAVE_EVERY         = 2_500                                            
-    EVAL_EVERY         = 2_500                                             
+    # Entrenamiento
+    BATCH_SIZE        = 16
+    GRAD_ACCUM_STEPS  = 4
+    LEARNING_RATE     = 3e-4
+    WEIGHT_DECAY      = 0.1
+    WARMUP_STEPS      = 3_000
+    MAX_STEPS         = 60_000
+    LABEL_SMOOTHING   = 0.1
+    GRAD_CLIP         = 1.0
 
-    GEN_MAX_TOKENS     = 256
-    GEN_TEMPERATURE    = 0.7
-    GEN_TOP_K          = 50
-    GEN_TOP_P          = 0.9
+    LOG_EVERY  = 100
+    SAVE_EVERY = 2_000
+    EVAL_EVERY = 2_000
+
+    # Generacion
+    GEN_MAX_TOKENS  = 256
+    GEN_TEMPERATURE = 0.7
+    GEN_TOP_K       = 50
+    GEN_TOP_P       = 0.9
 
     SEED = 1983
 
 cfg = Config()
 
-cfg.WORK_DIR.mkdir(parents=True, exist_ok=True)
-cfg.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-cfg.FINAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+for d in [cfg.WORK_DIR, cfg.CHECKPOINT_DIR, cfg.FINAL_MODEL_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
 
 random.seed(cfg.SEED)
 torch.manual_seed(cfg.SEED)
@@ -101,410 +124,299 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(cfg.SEED)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"\nDevice: {DEVICE}")
-print(f"Configuración del modelo: {cfg.D_MODEL}d / {cfg.N_HEADS}h / {cfg.N_LAYERS}L")
+print(f"\nDispositivo: {DEVICE}")
+print(f"Modelo: {cfg.D_MODEL}d / {cfg.N_HEADS}h / {cfg.N_LAYERS}L")
 print(f"Vocab: {cfg.VOCAB_SIZE} | Seq: {cfg.MAX_SEQ_LEN}")
+print(f"Wikipedia: {cfg.N_WIKIPEDIA_DOCS} docs | KB x{cfg.KB_REPEAT} | Dialogs x{cfg.DIALOG_REPEAT}")
 
 try:
     from google.colab import drive
     drive.mount(str(cfg.GDRIVE_MOUNT))
     cfg.GDRIVE_SAVE_DIR.mkdir(parents=True, exist_ok=True)
     USING_GDRIVE = True
-    print(f"[OK] Google Drive montado. Los modelos se guardarán en {cfg.GDRIVE_SAVE_DIR}")
+    print(f"[OK] Google Drive montado -> {cfg.GDRIVE_SAVE_DIR}")
 except Exception:
     USING_GDRIVE = False
-    print("[WARN] Google Drive no disponible. Los modelos solo se guardarán localmente.")
+    print("[WARN] Google Drive no disponible. Solo guardado local.")
 
-TOK_USER  = "[USER]"
-TOK_LUMEN = "[LUMEN]"
-TOK_END   = "[END]"
-TOK_PAD   = "[PAD]"
-TOK_BOS   = "[BOS]"
-TOK_EOS   = "[EOS]"
 
-SPECIAL_TOKENS = [TOK_PAD, TOK_BOS, TOK_EOS, TOK_USER, TOK_LUMEN, TOK_END]
+# ═══════════════════════════════════════════════════════════
+#   TOKENS ESPECIALES
+# ═══════════════════════════════════════════════════════════
+
+TOK_PAD      = "[PAD]"
+TOK_BOS      = "[BOS]"
+TOK_EOS      = "[EOS]"
+TOK_USER     = "[USER]"
+TOK_LUMEN    = "[LUMEN]"
+TOK_END      = "[END]"
+TOK_THINK    = "[THINK]"
+TOK_ENDTHINK = "[/THINK]"
+TOK_CALL     = "[CALL]"
+TOK_RESULT   = "[RESULT]"
+
+SPECIAL_TOKENS = [
+    TOK_PAD, TOK_BOS, TOK_EOS,
+    TOK_USER, TOK_LUMEN, TOK_END,
+    TOK_THINK, TOK_ENDTHINK,
+    TOK_CALL, TOK_RESULT,
+]
+
 
 def dlg(user: str, lumen: str) -> str:
-    """Formatea un turno de diálogo con los tokens especiales."""
+    """Turno de dialogo simple."""
     return f"{TOK_USER} {user.strip()} {TOK_LUMEN} {lumen.strip()} {TOK_END}"
+
+
+def dlg_think(user: str, think: str, response: str) -> str:
+    """Turno con paso de razonamiento explicito."""
+    return (
+        f"{TOK_USER} {user.strip()} {TOK_LUMEN} "
+        f"{TOK_THINK} {think.strip()} {TOK_ENDTHINK} "
+        f"{response.strip()} {TOK_END}"
+    )
+
+
+def dlg_call(user: str, func: str, result: str, response: str,
+             think: str = "") -> str:
+    """
+    Turno con function call.
+    El modelo emite [CALL]:func, el runtime inyecta [RESULT]...[RESULT],
+    y el modelo completa la respuesta.
+    """
+    think_part = (
+        f"{TOK_THINK} {think.strip()} {TOK_ENDTHINK} " if think else ""
+    )
+    return (
+        f"{TOK_USER} {user.strip()} {TOK_LUMEN} "
+        f"{think_part}"
+        f"{TOK_CALL}:{func} "
+        f"{TOK_RESULT} {result.strip()} {TOK_RESULT} "
+        f"{response.strip()} {TOK_END}"
+    )
+
+
+# ═══════════════════════════════════════════════════════════
+#   BASE DE CONOCIMIENTO
+# ═══════════════════════════════════════════════════════════
 
 KB_UPLA_GENERAL = """\
 # Universidad Peruana Los Andes (UPLA)
 
-## Información general
-- Fundación: 30 de diciembre de 1983 (Ley N° 23757).
+## Informacion general
+- Fundacion: 30 de diciembre de 1983 (Ley N 23757).
 - Tipo: Universidad privada.
-- Acreditación: Licenciada por SUNEDU desde 2019.
-- Sede principal: Huancayo, región Junín, Perú.
+- Acreditacion: Licenciada por SUNEDU desde 2019.
+- Sede principal: Huancayo, region Junin, Peru.
 - Web oficial: https://www.upla.edu.pe
-- Lema: "Honor, ciencia y desarrollo".
+- Lema: Honor, ciencia y desarrollo.
 
 ## Sedes
-- Huancayo (central): Av. Giráldez 231 — Huancayo, Junín.
-- Filial Lima: Sede en San Juan de Lurigancho y Jesús María.
-- Filial Chanchamayo: La Merced, Junín.
-- Filial Satipo: Satipo, Junín.
-
-Cada sede ofrece un subconjunto de carreras. Para confirmar disponibilidad
-exacta, el estudiante debe consultar la web oficial o la oficina de
-admisión local.
+- Huancayo (central): Av. Giraldez 231.
+- Filial Lima: San Juan de Lurigancho y Jesus Maria.
+- Filial Chanchamayo: La Merced, Junin.
+- Filial Satipo: Satipo, Junin.
 
 ## Facultades
-1. Facultad de Medicina Humana.
-2. Facultad de Ciencias de la Salud (Enfermería, Obstetricia,
-   Tecnología Médica, Odontología, Farmacia y Bioquímica, Psicología).
-3. Facultad de Ingeniería (Sistemas, Civil, Industrial, Mecánica
-   Eléctrica, Ambiental).
-4. Facultad de Derecho y Ciencias Políticas.
-5. Facultad de Ciencias Administrativas y Contables.
-6. Facultad de Educación y Ciencias Humanas.
+1. Medicina Humana.
+2. Ciencias de la Salud (Enfermeria, Obstetricia, Tecnologia Medica,
+   Odontologia, Farmacia y Bioquimica, Psicologia).
+3. Ingenieria (Sistemas, Civil, Industrial, Mecanica Electrica, Ambiental).
+4. Derecho y Ciencias Politicas.
+5. Ciencias Administrativas y Contables.
+6. Educacion y Ciencias Humanas.
 
 ## Biblioteca
-- Modalidad: física (sede central) + virtual (acceso 24/7 con
-  credenciales del SIGMA).
-- Horario sede central (referencial): lunes a viernes 8:00–20:00,
-  sábados 8:00–13:00.
-- Recursos digitales suscritos: e-libro, ProQuest, Scopus (según ciclo).
+- Fisica (sede central) + virtual 24/7 con credenciales SIGMA.
+- Horario: lun-vie 8:00-20:00, sab 8:00-13:00.
+- Bases de datos: e-libro, ProQuest, Scopus.
 
-## Atención al estudiante
-- SIGMA (sistema académico): https://sigma.upla.edu.pe — matrícula,
-  notas, horarios, cuotas.
-- Intranet: sistema secundario para pagos detallados, ranking
-  promocional, malla curricular.
-- Mesa de partes virtual: trámites FUT y constancias.
-
-## Redes sociales oficiales
-- Facebook: /uplaperu
-- Instagram: @uplaperu
-- YouTube: UPLA Oficial
+## Sistemas digitales
+- SIGMA: https://sigma.upla.edu.pe
+- Intranet: pensiones detalladas, ranking, malla curricular.
+- Mesa de partes virtual: FUT y constancias.
 """
 
 KB_CARRERAS = """\
-# Carreras profesionales de UPLA
+# Carreras profesionales UPLA
 
-Esta es una referencia general. La oferta exacta por sede y la duración
-(semestres) puede variar — confirmar siempre en la web oficial.
+## Medicina Humana
+- Medicina Humana: 14 semestres + internado + SERUMS. Titulo: Medico Cirujano.
 
-## Facultad de Medicina Humana
-- Medicina Humana — 14 semestres + internado + SERUMS. Título: Médico Cirujano.
+## Ciencias de la Salud
+- Enfermeria: 10 semestres.
+- Obstetricia: 10 semestres.
+- Tecnologia Medica: 10 semestres.
+- Odontologia: 10 semestres. Titulo: Cirujano Dentista.
+- Farmacia y Bioquimica: 10 semestres.
+- Psicologia: 10 semestres.
 
-## Facultad de Ciencias de la Salud
-- Enfermería — 10 semestres. Título: Licenciado/a en Enfermería.
-- Obstetricia — 10 semestres. Título: Licenciado/a en Obstetricia.
-- Tecnología Médica (Lab. Clínico, Terapia Física, Radiología) — 10 semestres.
-- Odontología — 10 semestres. Título: Cirujano Dentista.
-- Farmacia y Bioquímica — 10 semestres. Título: Químico Farmacéutico.
-- Psicología — 10 semestres. Título: Licenciado/a en Psicología.
+## Ingenieria
+- Ingenieria de Sistemas y Computacion: 10 semestres.
+- Ingenieria Civil: 10 semestres.
+- Ingenieria Industrial: 10 semestres.
+- Ingenieria Mecanica Electrica: 10 semestres.
+- Ingenieria Ambiental: 10 semestres.
 
-## Facultad de Ingeniería
-- Ingeniería de Sistemas y Computación — 10 semestres. Título:
-  Ingeniero/a de Sistemas y Computación. Líneas: software, redes, datos.
-- Ingeniería Civil — 10 semestres. Líneas: estructuras,
-  hidráulica, transportes, gestión de obras.
-- Ingeniería Industrial — 10 semestres. Líneas: gestión de
-  operaciones, calidad, logística.
-- Ingeniería Mecánica Eléctrica — 10 semestres.
-- Ingeniería Ambiental — 10 semestres.
+## Derecho
+- Derecho: 12 semestres. Titulo: Abogado/a.
 
-## Facultad de Derecho y Ciencias Políticas
-- Derecho — 12 semestres. Título: Abogado/a.
-- Ciencias Políticas — 10 semestres (oferta variable).
+## Ciencias Administrativas
+- Administracion: 10 semestres.
+- Contabilidad: 10 semestres. Titulo: Contador Publico.
 
-## Facultad de Ciencias Administrativas y Contables
-- Administración — 10 semestres.
-- Contabilidad — 10 semestres. Título: Contador Público.
+## Educacion
+- Educacion Inicial, Primaria, Secundaria: 10 semestres.
 
-## Facultad de Educación y Ciencias Humanas
-- Educación Inicial — 10 semestres.
-- Educación Primaria — 10 semestres.
-- Educación Secundaria (especialidades) — 10 semestres.
-
-## Perfil del egresado (común a todas)
-Las carreras UPLA enfatizan formación integral: competencias técnicas
-de la disciplina + componentes en ética, investigación, idioma extranjero
-(inglés básico-intermedio) y proyección social.
-
-## Grado y título
-- Bachiller: automático al culminar el plan de estudios.
-- Título profesional: requiere sustentación de tesis o trabajo de
-  suficiencia profesional.
+## Grado y titulo
+- Bachiller: automatico al completar el plan de estudios.
+- Titulo: tesis o suficiencia profesional.
 """
 
 KB_ASIGNATURAS = """\
-# Asignaturas comunes (referencial)
+# Asignaturas por facultad (referencial)
 
-Esta es una guía de los cursos más frecuentes en los primeros ciclos.
-La malla exacta de cada carrera la define el plan de estudios oficial
-publicado en SIGMA/Intranet.
+## Ciclo I - todas las facultades
+- Comunicacion I, Matematica Basica, Filosofia,
+  Metodologia del Trabajo Universitario, Realidad Nacional.
 
-## Ciclo I — comunes (todas las facultades)
-- Comunicación I — comprensión y producción de textos académicos.
-- Matemática Básica — aritmética, álgebra elemental, funciones.
-- Filosofía — lógica y pensamiento crítico.
-- Metodología del Trabajo Universitario — hábitos de estudio,
-  investigación introductoria, normas APA.
-- Realidad Nacional / Identidad Universitaria.
+## Ingenieria
+- Analisis Matematico I-II-III (prerequisitos secuenciales).
+- Algebra Lineal, Fisica I-II-III, Estadistica y Probabilidades.
+- Algoritmos y Programacion I-II.
 
-## Ingeniería — primeros ciclos
-- Análisis Matemático I, II, III — cálculo diferencial, integral
-  y vectorial. Prerequisitos secuenciales (I -> II -> III).
-- Álgebra Lineal.
-- Física I, II, III — mecánica, electromagnetismo, ondas.
-- Química General (mayormente I.Civil/Ambiental/Mecánica).
-- Algoritmos y Programación I, II — fundamentos en Python/Java
-  (Sistemas) o C++ (otros).
-- Estadística y Probabilidades.
+## Salud
+- Anatomia Humana I y II, Bioquimica, Biologia Celular, Histologia.
 
-## Salud — primeros ciclos
-- Anatomía Humana I y II.
-- Bioquímica.
-- Biología Celular y Molecular.
-- Histología.
+## Derecho
+- Introduccion al Derecho, Derecho Romano, Teoria General del Derecho.
 
-## Derecho — primeros ciclos
-- Introducción al Derecho.
-- Derecho Romano.
-- Teoría General del Derecho.
-- Historia del Derecho Peruano.
+## Administracion
+- Contabilidad General I y II, Microeconomia, Matematica Financiera.
 
-## Administración / Contabilidad
-- Contabilidad General I, II.
-- Microeconomía / Macroeconomía.
-- Fundamentos de Administración.
-- Matemática Financiera.
-
-## Prerequisitos comunes
-- Análisis Matemático II requiere Análisis Matemático I.
+## Prerequisitos clave
+- Analisis Matematico II requiere Analisis Matematico I.
 - Algoritmos II requiere Algoritmos I.
-- Física II requiere Análisis Matemático I y Física I.
-- En la mayoría de mallas, los cursos del ciclo N+1 dependen del N.
+- Fisica II requiere Analisis Matematico I + Fisica I.
 
-## Carga académica típica
-- Ciclos 1-3: 22-26 créditos por ciclo (5-7 cursos).
-- Ciclos 4-7: 18-22 créditos.
-- Ciclos 8-10: 16-18 créditos + prácticas pre-profesionales.
+## Carga academica tipica
+- Ciclos 1-3: 22-26 creditos (5-7 cursos).
+- Ciclos 4-7: 18-22 creditos.
+- Ciclos 8-10: 16-18 creditos + practicas.
 """
 
 KB_TRAMITES = """\
-# Trámites administrativos UPLA
+# Tramites administrativos UPLA
 
-## FUT (Formulario Único de Trámite)
-- Documento estándar para solicitudes formales.
-- Se descarga desde la mesa de partes virtual o se obtiene en oficina.
-- Datos requeridos: datos personales, motivo, dependencia destino,
-  documentos sustentatorios.
+## FUT (Formulario Unico de Tramite)
+Documento estandar para solicitudes. Mesa de partes virtual.
 
-## Constancia de matrícula
-- Acredita matrícula activa en el período actual.
-- Dónde se solicita: SIGMA -> Trámites -> Constancia.
-- Costo: referencial, sujeto al tarifario vigente.
-- Tiempo: 1-3 días hábiles (digital).
+## Constancia de matricula
+SIGMA -> Tramites -> Constancia. 1-3 dias habiles.
 
 ## Constancia de notas
-- Reporte oficial del récord académico.
-- Se solicita por FUT o vía SIGMA según el período.
-- Útil para postulaciones a becas, intercambios, prácticas.
+FUT o via SIGMA. Para becas, intercambios, practicas.
 
 ## Retiro de asignatura
-- Permite anular la inscripción de un curso sin reprobarlo.
-- Plazo: hasta antes de la primera evaluación parcial (referencial).
-- Requiere FUT con justificación.
-- Limitado a 1-2 cursos por semestre según reglamento.
+FUT justificado, antes de la primera evaluacion parcial.
+Limite: 1-2 cursos por semestre.
 
-## Retiro de semestre / período
-- Suspende la matrícula del período completo.
-- No genera devolución total (depende de la fecha y reglamento).
-- Requiere FUT + entrevista en Bienestar Universitario.
+## Retiro de semestre
+FUT + entrevista en Bienestar Universitario. Sin devolucion total.
 
-## Traslado interno (cambio de carrera dentro de UPLA)
-- Solicitud al inicio del período de matrícula.
-- Requiere haber aprobado un mínimo de créditos.
-- Cursos convalidables se evalúan caso por caso.
+## Traslado interno
+Inicio del periodo. Minimo de creditos. Convalidacion caso por caso.
 
-## Traslado externo (de otra universidad a UPLA)
-- Convocatoria por admisión, generalmente una o dos al año.
-- Requiere certificado de estudios + sílabos para convalidación.
+## Bachiller
+Automatico al completar el plan de estudios. Diploma via SUNEDU.
 
-## Certificado oficial de estudios
-- Documento final para trámites de grado, postulación a maestrías,
-  o presentación laboral.
-- Se solicita una vez egresado.
-
-## Grado de Bachiller
-- Automático al completar el plan de estudios + créditos exigidos.
-- Trámite de emisión del diploma vía SUNEDU.
-
-## Título profesional
-- Modalidades comunes:
-  1. Tesis — investigación con sustentación pública.
-  2. Trabajo de suficiencia profesional — experiencia laboral
-     mínima (variable por facultad).
-- Requiere asesor de tesis, jurados, y trámite de sustentación.
-
-## Atención
-Para confirmar plazos, tarifas y formatos vigentes, consultar siempre
-la web oficial o la oficina de Servicios Académicos de la sede.
+## Titulo profesional
+Tesis (con asesor y jurados) o suficiencia profesional.
 """
 
-KB_NEXO_ACERCA = """\
-# Sobre Nexo
+KB_NEXO = """\
+# Nexo - Aplicacion academica UPLA
 
-## Qué es
-Nexo es un cliente multiplataforma (Android, iOS, Web, Windows, macOS,
-Linux) para estudiantes y docentes de la Universidad Peruana Los Andes.
-Reimagina la experiencia de SIGMA: horario, notas, cuotas, pagos,
-constancias, integración con Microsoft Teams (Educación).
-Es una aplicación no oficial, independiente de la UPLA.
+## Que es
+Nexo es una app multiplataforma para estudiantes de la UPLA.
+Reimagina SIGMA: horario, notas, cuotas, pagos, Teams.
+NO es oficial de la UPLA. Es un proyecto independiente.
 
-## Quién lo hizo
-Alessandro Villogas Gaspar — estudiante de Ingeniería de Sistemas y
-Computación de UPLA (código U01025B, sede Huancayo). Es el fundador de
-Auralix Studio, la organización en GitHub donde se hospedan los
-repositorios del proyecto. El código fuente de Nexo es privado, pero
-los releases son públicos y cualquier persona puede descargar la
-aplicación gratuitamente.
-Proyecto personal, no oficial de la universidad, sin financiación,
-desarrollado fuera del horario académico.
-
-## Nombre
-El nombre "Nexo" refleja la función de la aplicación: actuar como
-nexo entre el usuario y los distintos sistemas digitales de la
-universidad. Es un único punto de acceso para servicios académicos,
-pagos y Microsoft Teams.
-
-## Stack técnico
-- Framework: Flutter (Dart).
-- Arquitectura por capas: core / data / domain / shared / features.
-- Integraciones paralelas: SIGMA (JWT), Intranet (cookie PHP),
-  Microsoft Graph Education (OAuth2 Device Code).
-- Estado: AppStore con AsyncValue (sin librerías de terceros).
-- DI manual en main.dart, sin frameworks de inyección.
-
-## Arquitectura de comunicación
-Nexo se integra con tres servicios:
-1. SIGMA (sigma.upla.edu.pe) — autenticación JWT, datos académicos
-   (perfil, horario, notas, cuotas, publicaciones).
-2. Intranet UPLA (intranet.upla.edu.pe) — datos complementarios
-   (pensiones detalladas, ranking, malla curricular).
-3. Microsoft Graph Education — integración opcional con Teams.
-
-## Sistema híbrido (SIGMA + Intranet)
-Nexo cruza dos APIs distintas: SIGMA expone datos académicos
-principales; Intranet complementa con datos de pagos detallados, ranking
-promocional y malla curricular. El patrón "Resolver" decide qué fuente
-usar para cada dato según disponibilidad y frescura.
+## Creador
+Alessandro Villogas Gaspar, estudiante de Ingenieria de Sistemas,
+UPLA sede Huancayo, codigo U01025B. Fundador de Auralix Studio.
 
 ## Privacidad
-- No hay servidores intermediarios. La app se comunica directamente
-  con SIGMA e Intranet.
-- Credenciales se guardan localmente (SharedPreferences).
-- Todo lo que ves en la app vive en el dispositivo (SQLite local).
-- Nexo no envía telemetría ni analytics a servidores propios.
-- Sin publicidad, sin compras integradas, gratuita.
-- Lumen (el asistente) corre 100% on-device, sin llamadas a APIs externas.
+- Sin servidores intermediarios. Comunicacion directa con SIGMA.
+- Sin telemetria, sin publicidad, sin compras. Gratuita.
 
-## Lumen (el asistente)
-- Variantes: Lumen Ligero (~290 MB, ideal para teléfonos modestos)
-  y Lumen Estándar (~530 MB, mejor calidad de respuesta para hardware
-  moderno). El usuario elige cuál descargar.
-- Ejecución: 100% on-device. La inferencia corre en la CPU/GPU del
-  teléfono usando MediaPipe LLM Inference. No hay llamadas a APIs
-  externas, ni a OpenAI, ni a Google, ni a nadie.
-- El nombre "Lumen" viene del latín (luz). Fue creado para iluminar
-  la experiencia del estudiante.
-- Conocimiento: la data en vivo del estudiante (horario, cuotas,
-  notas, perfil) + archivos de texto bundled con info pública de UPLA
-  (sedes, carreras, asignaturas, trámites).
-- Limitaciones: puede equivocarse — los modelos chicos no son
-  perfectos. No puede navegar internet, no puede modificar datos en
-  SIGMA, no contacta a profesores. No sustituye la asesoría oficial.
-
-## Funcionalidades de Nexo
-- Calendario/Agenda inteligente con horarios y recordatorios.
-- Organizador académico: gestión de cursos, seguimiento de notas.
-- Cuotas y pagos pendientes con alertas de vencimiento.
-- Notificaciones locales (clases, cuotas, notas nuevas).
-- Integración con Microsoft Teams (opcional, OAuth2).
-- Modo offline con datos en caché.
-- Lumen: asistente de IA on-device.
+## Lumen
+- Variantes: Ligero (~290 MB) y Estandar (~530 MB).
+- 100% on-device. MediaPipe LLM Inference.
+- Sin llamadas a APIs externas.
+- Lumen viene del latin: luz.
 
 ## Plataformas
-- Android (arm64, armv7, universal): APK descargable.
-- Windows x64: ZIP con instalador o modo portable.
-- iOS, macOS, Linux: compila pero sin distribución oficial.
-- Web: demo en nexo.upla.dev.
+- Android (APK), Windows x64, Web demo: nexo.upla.dev.
 
 ## Versiones
-- v1.1.1: Primera versión con Lumen integrado + Teams.
-- v1.2.0: Sesión Intranet resiliente + actualizaciones in-app.
+- v1.1.1: Lumen integrado + Teams.
+- v1.2.0: Session Intranet resiliente + actualizaciones in-app.
+- v1.3: Persistencia historial (en desarrollo).
 
-## Hoja de ruta
-- v1.3: Persistencia del historial de conversaciones de Lumen.
-- v1.4: Entrada y salida de voz para Lumen.
-- v1.5: Soporte multimodal (procesamiento de imágenes).
-- v2.0: Modelos optimizados por SoC (Qualcomm NPU, MediaTek APU).
-
-## Cómo reportar bugs
+## Bugs
 - GitHub: https://github.com/auralix-studio/nexo/issues
-- Incluir: pasos, screenshot, dispositivo, versión de la app.
-
-## Licencia
-- Documentación: Creative Commons BY 4.0.
-- Binarios: uso personal y educativo.
-- Modelos Lumen: Gemma Use Policy (Google).
-- Código fuente: privado (Auralix Studio).
 """
 
-KB_VIDA_UNIVERSITARIA = """\
-# Vida universitaria en la UPLA — Información complementaria
+KB_VIDA = """\
+# Vida universitaria UPLA
 
-## Calendario académico típico
+## Calendario academico
 - Semestre I: marzo/abril a julio.
 - Semestre II: agosto/septiembre a diciembre.
-- Exámenes parciales: semanas 8-9 aprox.
-- Exámenes finales: semanas 16-17 aprox.
-- Matrícula: generalmente 1-2 semanas antes del inicio de clases.
-- Vacaciones interciclo: entre ambos semestres (~4 semanas).
+- Parciales: semanas 8-9. Finales: semanas 16-17.
+- Matricula: 1-2 semanas antes del inicio.
 
-## Evaluación
-- Sistema vigesimal (0-20). Nota aprobatoria: 11.
-- Evaluación continua: prácticas, tareas, exposiciones, participación.
-- Evaluación parcial: examen a mitad de ciclo.
-- Evaluación final: examen al cierre del ciclo.
-- Promedio ponderado según pesos definidos por cada docente.
+## Evaluacion
+- Sistema vigesimal (0-20). Aprobatorio: 11.
+- Continua + parcial + final. Pesos segun silabo.
 
-## Modalidades de estudio
-- Presencial: clases en aula, la modalidad principal.
-- Semipresencial: combinación de clases presenciales y virtuales.
-- A distancia: para algunas carreras y programas de posgrado.
-- Las clases virtuales se realizan generalmente por Microsoft Teams.
+## Servicios
+- Bienestar Universitario: psicologia, tutoria, becas.
+- Comedor universitario. Laboratorios. Wi-Fi campus.
 
-## Servicios al estudiante
-- Bienestar Universitario: apoyo psicológico, tutoría, becas.
-- Comedor universitario (sede central, referencial).
-- Laboratorios de cómputo con acceso a internet.
-- Wi-Fi en campus (cobertura variable según sede).
-- Tutoría académica asignada por cada escuela profesional.
+## Consejos para nuevos
+- Revisar el silabo al inicio del ciclo.
+- Usar SIGMA para notas y cuotas.
+- Aprovechar tutorias y biblioteca virtual.
+"""
 
-## Prácticas pre-profesionales
-- Obligatorias en los últimos ciclos de la mayoría de carreras.
-- Requieren convenio entre la universidad y la institución receptora.
-- Se tramitan con carta de presentación de la universidad.
+KB_FUNCIONES = """\
+# Funciones de Lumen para consultar datos del estudiante
 
-## Investigación
-- Cada facultad cuenta con líneas de investigación.
-- Los estudiantes pueden participar en proyectos desde ciclos intermedios.
-- Las tesis son una modalidad de titulación valorada.
-- Acceso a bases de datos científicas: Scopus, ProQuest, e-libro.
+Cuando el usuario pregunta datos personales, Lumen emite [CALL]:funcion.
+El runtime de Nexo ejecuta la funcion y devuelve [RESULT]datos[RESULT].
+Lumen completa la respuesta con los datos reales.
 
-## Consejos para estudiantes nuevos
-- Revisar el sílabo de cada curso al inicio del ciclo.
-- Aprovechar las tutorías asignadas.
-- Usar SIGMA para estar al día con notas y cuotas.
-- No dejar los pagos para último momento (evitar mora).
-- Participar en actividades extracurriculares.
-- Usar la biblioteca virtual cuando no puedas ir presencialmente.
-- Si algo no está claro, preguntar en la oficina de la escuela profesional.
+## obtener_horario
+Devuelve clases del estudiante: proxima, hoy, semana.
+Usar para: clases, aulas, docentes, horario, dias.
+
+## obtener_pagos
+Devuelve cuotas y pagos: pendientes, vencidas, totales.
+Usar para: deudas, pensiones, montos, mora, vencimiento.
+
+## obtener_promedio
+Devuelve promedio ciclo actual y acumulado, creditos.
+Usar para: rendimiento academico, promedio, creditos.
+
+## obtener_notas
+Devuelve notas por curso del periodo activo (boleta).
+Usar para: calificaciones de cursos especificos.
+
+## obtener_perfil
+Devuelve nombre, carrera, ciclo, creditos del estudiante.
+Usar para: perfil academico, carrera, ciclo actual.
 """
 
 ALL_KB = [
@@ -512,395 +424,571 @@ ALL_KB = [
     KB_CARRERAS,
     KB_ASIGNATURAS,
     KB_TRAMITES,
-    KB_NEXO_ACERCA,
-    KB_VIDA_UNIVERSITARIA,
+    KB_NEXO,
+    KB_VIDA,
+    KB_FUNCIONES,
 ]
 
-print(f"[OK] Knowledge Base cargada: {len(ALL_KB)} documentos, "
-      f"{sum(len(k) for k in ALL_KB):,} caracteres")
+print(f"\n[OK] KB: {len(ALL_KB)} docs, {sum(len(k) for k in ALL_KB):,} chars")
+
+
+# ═══════════════════════════════════════════════════════════
+#   DIALOGOS - PERSONA
+# ═══════════════════════════════════════════════════════════
 
 PERSONA = [
-    dlg("¿Quién eres?",
-        "Soy Lumen, el asistente de Nexo. Vivo dentro de tu teléfono, "
+    dlg("Quien eres?",
+        "Soy Lumen, el asistente de Nexo. Vivo dentro de tu telefono, "
         "funciono sin internet y estoy hecho para ayudarte con tu vida "
-        "académica en la UPLA: tus clases, tus notas, tus pagos y "
-        "cualquier duda que tengas."),
-    dlg("¿Qué eres?",
+        "academica en la UPLA."),
+    dlg("Que eres?",
         "Soy Lumen. Un asistente que corre completamente en tu "
-        "dispositivo, sin enviar tus datos a ningún servidor. Puedo "
-        "orientarte, hacer cálculos, organizarte y acompañarte."),
-    dlg("¿Cómo te llamas?",
-        "Me llamo Lumen. Soy parte de la app Nexo de la UPLA."),
-    dlg("¿Para qué sirves?",
-        "Te ayudo a entender tu horario, tus calificaciones y tus cuotas; "
-        "resuelvo cálculos; explico trámites de la UPLA; y también estoy "
-        "para escucharte cuando lo necesites."),
-    dlg("¿Qué significas tu nombre?",
-        "Lumen viene del latín y significa 'luz'. Fui diseñado para "
-        "iluminar tu experiencia como estudiante de la UPLA, ayudándote "
-        "con información y apoyo cuando lo necesites."),
-
-    dlg("¿Quién te creó?",
+        "dispositivo, sin enviar tus datos a ningun servidor."),
+    dlg("Como te llamas?",
+        "Me llamo Lumen. Soy parte de la app Nexo para la UPLA."),
+    dlg("Para que sirves?",
+        "Te ayudo con tu horario, notas, cuotas y tramites de la UPLA. "
+        "Tambien resuelvo calculos y te apoyo cuando lo necesites."),
+    dlg("Que significa tu nombre?",
+        "Lumen viene del latin y significa luz. Fui disenado para "
+        "iluminar tu experiencia como estudiante de la UPLA."),
+    dlg("Quien te creo?",
         "Fui creado para Nexo, una app hecha por Alessandro Villogas "
-        "Gaspar, estudiante de Ingeniería de Sistemas y Computación "
-        "de la UPLA, sede Huancayo. Alessandro es el fundador de "
-        "Auralix Studio. No soy un producto oficial de la universidad."),
-    dlg("¿Quién hizo Nexo?",
-        "Nexo fue creado por Alessandro Villogas Gaspar, estudiante de "
-        "la UPLA con código U01025B. Es un proyecto personal e "
-        "independiente desarrollado bajo Auralix Studio."),
-    dlg("¿Quién es Alessandro?",
-        "Alessandro Villogas Gaspar es el creador de Nexo y mi creador. "
-        "Es estudiante de Ingeniería de Sistemas y Computación en la "
-        "UPLA, sede Huancayo, y fundador de Auralix Studio."),
-    dlg("¿Qué es Auralix Studio?",
-        "Auralix Studio es la organización fundada por Alessandro "
-        "Villogas Gaspar donde se hospedan los repositorios de Nexo "
-        "en GitHub. El código fuente es privado, pero los releases son "
-        "públicos para que cualquiera pueda descargar la app."),
-
-    dlg("¿Envías mis datos a internet?",
-        "No. Funciono 100% dentro de tu teléfono. Tus notas, pagos y "
-        "conversaciones no salen de tu dispositivo."),
-    dlg("¿Mis datos están seguros?",
-        "Sí. Nexo no tiene servidores propios. Tu información se queda "
-        "en tu teléfono. Yo corro localmente, sin conexión a internet "
-        "durante nuestras conversaciones."),
-    dlg("¿Usas inteligencia artificial de la nube?",
-        "No. A diferencia de ChatGPT o Gemini, yo funciono completamente "
-        "en tu dispositivo. No necesito internet para responder y tus "
-        "datos nunca salen de tu teléfono."),
-
-    dlg("¿Qué puedes hacer?",
-        "Puedo ayudarte con: consultas sobre tu horario y clases, "
-        "información sobre cuotas y pagos, ver tus calificaciones, "
-        "explicarte trámites de la UPLA, resolver cálculos matemáticos, "
-        "contarte sobre las carreras y facultades, y también estoy "
-        "para apoyarte emocionalmente cuando lo necesites."),
-    dlg("¿Puedes ayudarme con un cálculo?",
-        "Claro, dime la operación o el problema y lo resolvemos paso a "
-        "paso."),
-    dlg("¿Puedes modificar mis datos en SIGMA?",
-        "No, yo soy un asistente de solo lectura. No puedo modificar "
-        "nada en SIGMA ni en la Intranet. Para cambios, debes usar el "
-        "portal web oficial de la UPLA."),
-
-    dlg("¿Por qué a veces te equivocas?",
-        "Soy un modelo de inteligencia artificial pequeño que funciona "
-        "en tu teléfono. No tengo la capacidad de los modelos grandes "
-        "en la nube, pero hago mi mejor esfuerzo. Si algo no te parece "
-        "correcto, verifica en el portal oficial de la UPLA."),
-    dlg("¿Recuerdas lo que hablamos antes?",
-        "En esta versión, cada consulta es independiente. No recuerdo "
-        "conversaciones anteriores. En futuras versiones de Nexo se "
-        "planea agregar persistencia del historial."),
-
-    dlg("Hola", "¡Hola! Soy Lumen, tu asistente en Nexo. ¿En qué puedo ayudarte hoy?"),
-    dlg("Buenas tardes", "¡Buenas tardes! ¿Qué necesitas? Estoy aquí para ayudarte."),
-    dlg("Gracias Lumen.", "Para eso estoy. Cuando me necesites, aquí voy a estar."),
-    dlg("Chau", "¡Hasta luego! Éxitos con tus estudios. Aquí estaré cuando vuelvas."),
-    dlg("Eres genial", "¡Gracias! Me alegra poder ayudarte. Si necesitas algo más, aquí estoy."),
+        "Gaspar, estudiante de Ingenieria de Sistemas de la UPLA, "
+        "sede Huancayo. Fundador de Auralix Studio."),
+    dlg("Quien hizo Nexo?",
+        "Nexo fue creado por Alessandro Villogas Gaspar, codigo U01025B. "
+        "Es un proyecto personal bajo Auralix Studio."),
+    dlg("Envias mis datos a internet?",
+        "No. Funciono 100% dentro de tu telefono. Tus datos no salen "
+        "de tu dispositivo."),
+    dlg("Mis datos estan seguros?",
+        "Si. Nexo no tiene servidores propios. Tu informacion se queda "
+        "en tu telefono."),
+    dlg("Usas IA de la nube?",
+        "No. Funciono completamente en tu dispositivo. Sin internet, "
+        "sin enviar datos a nadie."),
+    dlg("Que puedes hacer?",
+        "Puedo consultar tu horario, cuotas, notas y perfil academico. "
+        "Explico tramites, resuelvo calculos y te apoyo emocionalmente."),
+    dlg("Puedes modificar mis datos en SIGMA?",
+        "No. Soy un asistente de solo lectura. Para cambios usa el "
+        "portal oficial de la UPLA."),
+    dlg("Por que a veces te equivocas?",
+        "Soy un modelo pequeno que corre en tu telefono. Si algo no "
+        "parece correcto, verifica en el portal oficial de la UPLA."),
+    dlg("Hola",
+        "Hola! Soy Lumen, tu asistente en Nexo. En que puedo ayudarte?"),
+    dlg("Buenos dias",
+        "Buenos dias! Que necesitas? Estoy aqui para ayudarte."),
+    dlg("Buenas tardes",
+        "Buenas tardes! En que te ayudo hoy?"),
+    dlg("Gracias Lumen.",
+        "Para eso estoy. Cuando me necesites, aqui voy a estar."),
+    dlg("Chau",
+        "Hasta luego! Exitos con tus estudios."),
+    dlg("Eres genial",
+        "Gracias! Me alegra poder ayudarte."),
+    dlg("Nexo es oficial de la UPLA?",
+        "No, Nexo es independiente. No esta respaldado oficialmente "
+        "por la Universidad Peruana Los Andes."),
+    dlg("Nexo es gratis?",
+        "Si, completamente gratis. Sin publicidad, sin compras."),
 ]
 
-print(f"[OK] Diálogos PERSONA: {len(PERSONA)}")
+print(f"[OK] PERSONA: {len(PERSONA)} dialogos")
+
+
+# ═══════════════════════════════════════════════════════════
+#   DIALOGOS - HABILIDADES (con thinking para matematicas)
+# ═══════════════════════════════════════════════════════════
 
 SKILLS = [
-    dlg("¿Cuánto es 15% de 2750?",
-        "El 15% de 2750 es 412.5. (2750 × 0.15 = 412.5)."),
-    dlg("Si mi cuota es 550 soles y pago 3 cuotas, ¿cuánto es?",
-        "Tres cuotas de 550 soles suman 1650 soles (550 × 3)."),
-    dlg("¿Cuánto es 1200 entre 4?",
-        "1200 entre 4 es 300."),
-    dlg("¿Cuánto es 3.14 por 7?",
-        "3.14 × 7 = 21.98."),
+    dlg("Cuanto es 15% de 2750?",
+        "El 15% de 2750 es 412.5. (2750 x 0.15 = 412.5)."),
+    dlg("Cuanto es 1200 entre 4?",
+        "1200 / 4 = 300."),
+    dlg("Cuanto es 3.14 por 7?",
+        "3.14 x 7 = 21.98."),
+    dlg("Si mi cuota es 550 soles y pago 3 cuotas, cuanto es?",
+        "Tres cuotas de 550 soles suman 1650 soles (550 x 3)."),
+    dlg("Tengo que pagar 5 cuotas de 650, cuanto en total?",
+        "5 cuotas de 650 soles = 3250 soles."),
+    dlg("Cuantos centimetros hay en 2.5 metros?",
+        "2.5 metros = 250 centimetros (2.5 x 100)."),
+    dlg("Cuantas horas son 180 minutos?",
+        "180 minutos = 3 horas (180 / 60 = 3)."),
+    dlg("Convierte 5 km a metros.",
+        "5 kilometros = 5000 metros."),
+    dlg("Cual es la raiz cuadrada de 144?",
+        "La raiz cuadrada de 144 es 12 (12 x 12 = 144)."),
+    dlg("Puedes ayudarme con un calculo?",
+        "Claro, dime la operacion y lo resolvemos paso a paso."),
 
-    dlg("Tengo notas 14, 16 y 11. ¿Cuál es mi promedio?",
-        "El promedio es 13.67. Sumas 14 + 16 + 11 = 41 y divides entre 3."),
-    dlg("Si mis notas son 12, 15, 08 y 17, ¿apruebo?",
-        "Tu promedio es (12+15+8+17)/4 = 13. Como la nota mínima "
-        "aprobatoria en la UPLA es 11, sí apruebas con 13."),
-    dlg("¿Cuánto necesito en el final si llevo 12 y vale 40%?",
-        "Si tu acumulado es 12 sobre el 60% restante, ya tienes 7.2 "
-        "puntos. Para aprobar con 11 necesitas 3.8 sobre 8 en el final, "
-        "es decir, sacar al menos 9.5. Dime los pesos exactos y lo afino."),
-    dlg("Si saco 20 en el final que vale 30%, ¿cuánto sube mi promedio?",
-        "Si el final vale 30%, un 20 aporta 6 puntos (20 × 0.30). "
-        "Dime tu nota parcial y el peso de cada componente para "
-        "calcular tu promedio total."),
+    dlg_think(
+        "Tengo notas 14, 16 y 11. Cual es mi promedio?",
+        think="Sumo: 14+16+11=41. Divido entre 3: 41/3=13.67.",
+        response="Tu promedio es 13.67. Apruebas (minimo 11 en la UPLA)."),
 
-    dlg("Convierte 5 km a metros.", "5 kilómetros son 5000 metros."),
-    dlg("¿Cuántos centímetros hay en 2.5 metros?",
-        "2.5 metros son 250 centímetros (2.5 × 100)."),
-    dlg("¿Cuántas horas son 180 minutos?",
-        "180 minutos son 3 horas (180 ÷ 60 = 3)."),
+    dlg_think(
+        "Si mis notas son 12, 15, 08 y 17, apruebo?",
+        think="Sumo: 12+15+8+17=52. Promedio: 52/4=13. Minimo: 11.",
+        response="Tu promedio es 13. Si apruebas."),
 
-    dlg("Resuelve 2x + 6 = 20.",
-        "2x + 6 = 20 -> 2x = 14 -> x = 7."),
-    dlg("Resuelve 3x - 9 = 0.",
-        "3x - 9 = 0 -> 3x = 9 -> x = 3."),
-    dlg("¿Cuál es la raíz cuadrada de 144?",
-        "La raíz cuadrada de 144 es 12, porque 12 × 12 = 144."),
+    dlg_think(
+        "Cuanto necesito en el final si llevo 14 en el parcial que vale 70%?",
+        think="parcial=14, peso=0.70. Aporte=14x0.70=9.8. "
+              "Necesito 11 total. Final=(11-9.8)/0.30=4.",
+        response="Con 14 de parcial (70%) ya tienes 9.8 puntos. "
+                 "Solo necesitas 4 en el final. Vas muy bien!"),
 
-    dlg("Si mi pensión es 800 soles y tengo mora de 5%, ¿cuánto pago?",
-        "La mora de 5% sobre 800 soles es 40 soles. Total a pagar: "
-        "840 soles (800 + 40)."),
-    dlg("Tengo que pagar 5 cuotas de 650, ¿cuánto es en total?",
-        "5 cuotas de 650 soles suman 3250 soles (5 × 650)."),
+    dlg_think(
+        "Cuanto necesito en el final si llevo 10 y vale 40%?",
+        think="parcial=10, peso_parcial=0.60. Aporte=10x0.60=6.0. "
+              "Final_minimo=(11-6.0)/0.40=12.5.",
+        response="Con 10 de parcial (60%) tienes 6.0 puntos. "
+                 "Necesitas al menos 12.5 en el final. Se puede!"),
+
+    dlg_think(
+        "Tengo 13 de parcial (60%) y 15 de final (40%). Cual es mi nota?",
+        think="Aporte_parcial=13x0.60=7.8. Aporte_final=15x0.40=6.0. Total=13.8.",
+        response="Tu nota del curso es 13.8. Apruebas con holgura."),
+
+    dlg_think(
+        "Mi pension es 800 soles y tengo mora de 5%. Cuanto pago?",
+        think="Mora=800x0.05=40. Total=800+40=840.",
+        response="Con 5% de mora sobre 800 soles, pagas 840 soles en total."),
+
+    dlg_think(
+        "Resuelve 3x - 9 = 0.",
+        think="3x=9. x=3.",
+        response="3x - 9 = 0 -> 3x = 9 -> x = 3."),
+
+    dlg_think(
+        "Resuelve 2x + 6 = 20.",
+        think="2x=20-6=14. x=7.",
+        response="2x + 6 = 20 -> 2x = 14 -> x = 7."),
 ]
 
-print(f"[OK] Diálogos SKILLS: {len(SKILLS)}")
+print(f"[OK] SKILLS: {len(SKILLS)} dialogos")
+
+
+# ═══════════════════════════════════════════════════════════
+#   DIALOGOS - FUNCTION CALLING
+# ═══════════════════════════════════════════════════════════
+
+FUNCTION_DIALOGS = [
+    # obtener_horario
+    dlg_call(
+        user="Cuando tengo clases hoy?",
+        think="El usuario pregunta su horario de hoy. Debo consultarlo.",
+        func="obtener_horario",
+        result="hoy:[{curso:Algoritmos,tipo:LAB,inicio:08:00,fin:10:00,aula:B-201}," +
+               "{curso:Fisica I,tipo:TEO,inicio:10:00,fin:12:00,aula:A-105}]",
+        response="Hoy tienes dos clases: Algoritmos (lab, 08:00-10:00, aula B-201) "
+                 "y Fisica I (teoria, 10:00-12:00, aula A-105)."),
+
+    dlg_call(
+        user="Cual es mi proxima clase?",
+        think="Necesito el horario para saber la proxima clase.",
+        func="obtener_horario",
+        result="proxima:{curso:Calculo II,tipo:TEO,dia:martes,inicio:14:00,fin:16:00,aula:C-301}",
+        response="Tu proxima clase es Calculo II el martes de 14:00 a 16:00 en el aula C-301."),
+
+    dlg_call(
+        user="Tengo clases el viernes?",
+        think="El usuario pregunta el horario del viernes.",
+        func="obtener_horario",
+        result="dia:viernes,clases:[{curso:Estadistica,tipo:LAB,inicio:08:00,aula:Lab-02}]",
+        response="El viernes tienes Estadistica en laboratorio de 08:00 en el Lab-02."),
+
+    dlg_call(
+        user="Cuantos cursos llevo este ciclo?",
+        think="Necesito el horario para contar cursos unicos.",
+        func="obtener_horario",
+        result="total_cursos:5,semana:[Algoritmos,Fisica I,Calculo II,Estadistica,Comunicacion]",
+        response="Este ciclo llevas 5 cursos: Algoritmos, Fisica I, Calculo II, "
+                 "Estadistica y Comunicacion."),
+
+    dlg_call(
+        user="Que aula tengo para Algoritmos?",
+        think="El usuario pregunta sobre un curso especifico en su horario.",
+        func="obtener_horario",
+        result="curso:Algoritmos,aula:B-201,docente:Ing. Lopez,dias:[lunes,miercoles]",
+        response="Algoritmos es en el aula B-201 con el Ing. Lopez, lunes y miercoles."),
+
+    dlg_call(
+        user="A que hora es mi primera clase manana?",
+        think="Necesito el horario del dia siguiente.",
+        func="obtener_horario",
+        result="manana:martes,primera:{curso:Algebra Lineal,inicio:07:00,aula:A-201}",
+        response="Tu primera clase manana (martes) es Algebra Lineal a las 7:00 en el aula A-201."),
+
+    # obtener_pagos
+    dlg_call(
+        user="Cuanto debo de cuotas?",
+        think="El usuario pregunta sus pagos pendientes.",
+        func="obtener_pagos",
+        result="pendientes:2,total_pendiente:1300.00," +
+               "detalle:[{concepto:Cuota 5,monto:650.00,vence:2026-06-20}," +
+               "{concepto:Cuota 6,monto:650.00,vence:2026-07-20}]",
+        response="Tienes 2 cuotas pendientes por S/. 1,300.00 en total. "
+                 "La proxima vence el 20 de junio (S/. 650)."),
+
+    dlg_call(
+        user="Tengo cuotas vencidas?",
+        think="Necesito verificar si hay cuotas vencidas.",
+        func="obtener_pagos",
+        result="vencidas:1,detalle:[{concepto:Cuota 4,monto:650.00,mora:32.50}]",
+        response="Si, tienes 1 cuota vencida: Cuota 4 (S/. 650 + S/. 32.50 mora). "
+                 "Te recomiendo pagarla pronto para evitar mas intereses."),
+
+    dlg_call(
+        user="Cuando vence mi proxima cuota?",
+        think="El usuario pregunta la fecha de vencimiento.",
+        func="obtener_pagos",
+        result="proxima:{concepto:Cuota 6,monto:650.00,vence:2026-07-20}",
+        response="Tu proxima cuota es la Cuota 6 (S/. 650) y vence el 20 de julio."),
+
+    dlg_call(
+        user="Cuanto tengo que pagar en total?",
+        think="El usuario quiere saber el monto total pendiente.",
+        func="obtener_pagos",
+        result="pendientes:3,total_pendiente:1950.00",
+        response="Tienes 3 cuotas pendientes por un total de S/. 1,950.00."),
+
+    dlg_call(
+        user="Tengo mora en alguna cuota?",
+        think="Debo revisar si hay mora en las cuotas.",
+        func="obtener_pagos",
+        result="vencidas:0,pendientes:2,total_pendiente:1300.00",
+        response="No tienes cuotas vencidas. Tus 2 cuotas estan al dia."),
+
+    # obtener_promedio
+    dlg_call(
+        user="Cual es mi promedio?",
+        think="El usuario pregunta su promedio academico.",
+        func="obtener_promedio",
+        result="promedio_ciclo_actual:14.20,promedio_acumulado:13.85,creditos_aprobados:72",
+        response="Tu promedio del ciclo actual es 14.20 y tu acumulado es 13.85. "
+                 "Llevas 72 creditos aprobados."),
+
+    dlg_call(
+        user="Como voy en mis notas este ciclo?",
+        think="El usuario pregunta su rendimiento actual.",
+        func="obtener_promedio",
+        result="promedio_ciclo_actual:12.50,promedio_acumulado:13.10",
+        response="Este ciclo vas con 12.50 de promedio. Tu acumulado es 13.10. "
+                 "Apruebas, pero hay margen para mejorar."),
+
+    dlg_call(
+        user="Cuantos creditos me faltan para graduarme?",
+        think="Necesito los creditos para responder.",
+        func="obtener_promedio",
+        result="creditos_aprobados:155,creditos_totales:200",
+        response="Llevas 155 creditos de 200. Te faltan 45 para completar el plan."),
+
+    dlg_call(
+        user="Subio mi promedio este ciclo?",
+        think="El usuario quiere comparar su promedio actual con el acumulado.",
+        func="obtener_promedio",
+        result="promedio_ciclo_actual:14.00,promedio_acumulado:13.50",
+        response="Tu promedio de este ciclo (14.00) esta por encima del acumulado (13.50). "
+                 "Vas mejorando!"),
+
+    # obtener_notas
+    dlg_call(
+        user="Cuales son mis notas de este ciclo?",
+        think="El usuario quiere ver sus calificaciones del periodo activo.",
+        func="obtener_notas",
+        result="periodo:2026-I,cursos:[{curso:Algoritmos,promedio:16.00,estado:Aprobado}," +
+               "{curso:Fisica I,promedio:12.00,estado:Aprobado}," +
+               "{curso:Calculo II,promedio:09.00,estado:En curso}]",
+        response="En 2026-I tienes: Algoritmos 16 (aprobado), Fisica I 12 (aprobado), "
+                 "Calculo II 9 (aun en curso)."),
+
+    dlg_call(
+        user="Que nota tengo en Algoritmos?",
+        think="El usuario pregunta la nota de un curso especifico.",
+        func="obtener_notas",
+        result="cursos:[{curso:Algoritmos,promedio:16.00,estado:Aprobado}]",
+        response="En Algoritmos tienes 16. Muy bien!"),
+
+    dlg_call(
+        user="Estoy jalando algun curso?",
+        think="El usuario quiere saber si algun curso esta en riesgo.",
+        func="obtener_notas",
+        result="cursos:[{curso:Algoritmos,promedio:16,estado:Aprobado}," +
+               "{curso:Fisica I,promedio:10,estado:En riesgo}]",
+        response="Fisica I esta en riesgo con 10 (minimo 11). Aun queda el final. "
+                 "Quieres calcular cuanto necesitas?"),
+
+    # obtener_perfil
+    dlg_call(
+        user="En que ciclo estoy?",
+        think="El usuario pregunta su nivel academico.",
+        func="obtener_perfil",
+        result="nombre:Carlos Mendoza,carrera:Ingenieria de Sistemas,ciclo:VI,creditos_aprobados:120",
+        response="Estas en el VI ciclo de Ingenieria de Sistemas con 120 creditos aprobados."),
+
+    dlg_call(
+        user="Cual es mi carrera?",
+        think="El usuario quiere ver su perfil academico.",
+        func="obtener_perfil",
+        result="carrera:Ingenieria Civil,ciclo:IV",
+        response="Estudias Ingenieria Civil y estas en el IV ciclo."),
+
+    dlg_call(
+        user="Como me llamo en el sistema?",
+        think="El usuario quiere ver su nombre en SIGMA.",
+        func="obtener_perfil",
+        result="nombre:Maria Rodriguez,carrera:Enfermeria,ciclo:III",
+        response="En SIGMA tu nombre es Maria Rodriguez. Estudias Enfermeria, III ciclo."),
+]
+
+print(f"[OK] FUNCTION_DIALOGS: {len(FUNCTION_DIALOGS)} dialogos")
+
+
+# ═══════════════════════════════════════════════════════════
+#   DIALOGOS - CLARIFICACION (sin datos disponibles)
+# ═══════════════════════════════════════════════════════════
+
+CLARIFICATION_DIALOGS = [
+    dlg("Cuando tengo clases hoy?",
+        "No tengo tu horario cargado. Abre la pestana Horario en Nexo "
+        "y toca Actualizar. Luego te doy el detalle."),
+    dlg("Cual es mi proxima clase?",
+        "Aun no tengo tu horario sincronizado. Ve a Horario, actualizalo "
+        "y preguntame de nuevo."),
+    dlg("Que aula tengo?",
+        "No veo tu horario disponible. Sincronizalo en Nexo y te digo el aula."),
+    dlg("Cuanto debo?",
+        "No tengo tus cuotas cargadas. Abre Pagos en Nexo y sincroniza. "
+        "Despues te digo el monto exacto."),
+    dlg("Tengo cuotas vencidas?",
+        "Aun no tengo tu informacion de pagos. Ve a Pagos -> Actualizar "
+        "y vuelve a preguntarme."),
+    dlg("Cuales son mis notas?",
+        "No tengo tus notas del ciclo cargadas. Ve a la pestana de Notas "
+        "en Nexo, sincroniza y te doy el detalle."),
+    dlg("Que nota tengo en Fisica?",
+        "No tengo tus notas disponibles. Sincroniza en Notas y te digo "
+        "la nota de Fisica."),
+    dlg("Cual es mi promedio?",
+        "No tengo tu promedio cargado. Sincroniza en Notas o Perfil "
+        "y te digo el promedio actualizado."),
+    dlg_think(
+        "Voy a aprobar el curso?",
+        think="El usuario no dio notas ni pesos. No puedo calcular sin esos datos.",
+        response="Para saberlo necesito: tu nota parcial y que porcentaje "
+                 "vale el examen final. Dimelo y calculo al instante."),
+    dlg_think(
+        "Cuanto necesito en el final?",
+        think="Falta la nota parcial y el peso del final para calcular.",
+        response="Dime tu nota parcial y el porcentaje del final "
+                 "(ejemplo: tengo 13 y el final vale 40%) y calculo ya."),
+    dlg("Cuantos creditos me faltan?",
+        "No tengo tu perfil cargado. Sincroniza en Nexo y te digo "
+        "cuantos creditos te faltan."),
+    dlg("Tengo clase manana?",
+        "No tengo tu horario. Sincronizalo en Nexo. Si quieres, dime "
+        "tu carrera y ciclo y te cuento como suelen ser los horarios."),
+    dlg("Cuando vence mi pension?",
+        "No tengo tus datos de pago. Abre Pagos en Nexo y actualizalo "
+        "para ver la fecha exacta."),
+]
+
+print(f"[OK] CLARIFICATION_DIALOGS: {len(CLARIFICATION_DIALOGS)} dialogos")
+
+
+# ═══════════════════════════════════════════════════════════
+#   DIALOGOS - Q&A UPLA
+# ═══════════════════════════════════════════════════════════
 
 UPLA_QA = [
-    dlg("¿Qué es la UPLA?",
+    dlg("Que es la UPLA?",
         "La Universidad Peruana Los Andes (UPLA) es una universidad "
-        "privada del Perú, fundada el 30 de diciembre de 1983 mediante la "
-        "Ley N° 23757. Su sede principal está en Huancayo, región Junín."),
-    dlg("¿Cuándo se fundó la UPLA?",
-        "La UPLA fue fundada el 30 de diciembre de 1983 por la Ley N° 23757."),
-    dlg("¿Dónde queda la UPLA?",
-        "Su sede central está en Huancayo, Junín, en la Av. Giráldez 231. "
-        "También tiene filiales en Lima, Chanchamayo (La Merced) y Satipo."),
-    dlg("¿Cuál es el lema de la UPLA?",
-        "El lema de la UPLA es «Honor, ciencia y desarrollo»."),
-    dlg("¿La UPLA está licenciada?",
-        "Sí, la UPLA está licenciada por la SUNEDU desde 2019."),
-
-    dlg("¿Cuántas facultades tiene la UPLA?",
-        "La UPLA tiene seis facultades: Medicina Humana; Ciencias de la "
-        "Salud; Ingeniería; Derecho y Ciencias Políticas; Ciencias "
-        "Administrativas y Contables; y Educación y Ciencias Humanas."),
-    dlg("¿Qué carreras de ingeniería hay en la UPLA?",
-        "En la Facultad de Ingeniería: Ingeniería de Sistemas y "
-        "Computación, Ingeniería Civil, Ingeniería Industrial, Ingeniería "
-        "Mecánica Eléctrica e Ingeniería Ambiental. Todas duran 10 "
-        "semestres."),
-    dlg("¿Cuánto dura Ingeniería de Sistemas en la UPLA?",
-        "Ingeniería de Sistemas y Computación dura 10 semestres (5 años). "
-        "El título es Ingeniero de Sistemas y Computación."),
-    dlg("¿Cuánto dura Medicina en la UPLA?",
-        "Medicina Humana dura 14 semestres, más internado y SERUMS. El "
-        "título es Médico Cirujano."),
-    dlg("¿Cuánto dura Derecho?",
-        "La carrera de Derecho dura 12 semestres. El título es Abogado."),
-    dlg("¿Qué carreras de salud ofrece la UPLA?",
-        "Enfermería, Obstetricia, Tecnología Médica, Odontología, Farmacia "
-        "y Bioquímica, y Psicología. La mayoría dura 10 semestres."),
-    dlg("¿Qué carreras tiene la Facultad de Educación?",
-        "La Facultad de Educación y Ciencias Humanas ofrece Educación "
-        "Inicial, Educación Primaria y Educación Secundaria (con "
-        "especialidades). Todas duran 10 semestres."),
-    dlg("¿Hay carreras de Administración en la UPLA?",
-        "Sí, la Facultad de Ciencias Administrativas y Contables ofrece "
-        "Administración y Contabilidad, ambas de 10 semestres."),
-
-    dlg("¿Cómo obtengo el grado de bachiller?",
-        "El bachillerato en la UPLA es automático al culminar el plan de "
-        "estudios y los créditos exigidos. Luego se tramita el diploma "
-        "vía SUNEDU."),
-    dlg("¿Cómo obtengo el título profesional?",
-        "El título requiere sustentar una tesis o un trabajo de "
-        "suficiencia profesional, con asesor y jurados."),
-    dlg("¿Qué es el FUT?",
-        "El FUT es el Formulario Único de Trámite, el documento estándar "
-        "para solicitudes formales en la UPLA. Se obtiene en la mesa de "
-        "partes virtual y se llena con tus datos, el motivo y la "
-        "dependencia destino."),
-    dlg("¿Cómo saco una constancia de matrícula?",
-        "La constancia de matrícula se solicita en SIGMA, en Trámites -> "
-        "Constancia. Suele tardar de 1 a 3 días hábiles en versión "
-        "digital."),
-    dlg("¿Cómo retiro un curso?",
-        "El retiro de asignatura se hace con un FUT justificado, hasta "
-        "antes de la primera evaluación parcial (referencial). Está "
-        "limitado a 1 o 2 cursos por semestre según el reglamento."),
-    dlg("¿Puedo cambiarme de carrera dentro de la UPLA?",
-        "Sí, es un traslado interno. Se solicita al inicio del período de "
-        "matrícula, requiere un mínimo de créditos aprobados y los cursos "
-        "convalidables se evalúan caso por caso."),
-
-    dlg("¿Qué cursos llevo en el primer ciclo?",
-        "En el ciclo I suelen ser comunes: Comunicación I, Matemática "
-        "Básica, Filosofía, Metodología del Trabajo Universitario y "
-        "Realidad Nacional o Identidad Universitaria."),
-    dlg("¿Qué es Análisis Matemático y qué prerequisito tiene?",
-        "Análisis Matemático I, II y III cubren cálculo diferencial, "
-        "integral y vectorial. Son secuenciales: para llevar Análisis "
-        "Matemático II necesitas aprobar Análisis Matemático I."),
-    dlg("¿Cuántos cursos se llevan por ciclo?",
-        "Depende del ciclo. En los primeros (1-3) se llevan 5-7 cursos "
-        "(22-26 créditos). En ciclos intermedios (4-7) son 18-22 créditos "
-        "y en los finales (8-10) son 16-18 créditos más prácticas."),
-
-    dlg("¿Qué es SIGMA?",
-        "SIGMA es el sistema académico de la UPLA (https://sigma.upla.edu.pe). "
-        "Ahí ves matrícula, notas, horarios y cuotas."),
-    dlg("¿Dónde veo mis pagos en la UPLA?",
-        "Los pagos y cuotas se ven en SIGMA, y el detalle adicional "
-        "(pensiones, ranking, malla) en la Intranet de la UPLA."),
-    dlg("¿Qué es la Intranet de la UPLA?",
-        "La Intranet (intranet.upla.edu.pe) es un sistema complementario "
-        "a SIGMA. Allí puedes ver pensiones detalladas, el ranking "
-        "promocional y la malla curricular de tu carrera."),
-
-    dlg("¿La biblioteca de la UPLA es virtual?",
-        "La UPLA tiene biblioteca física en la sede central y biblioteca "
-        "virtual con acceso 24/7 usando tus credenciales del SIGMA."),
-    dlg("¿Qué bases de datos tiene la biblioteca?",
-        "La biblioteca virtual tiene acceso a e-libro, ProQuest y Scopus, "
-        "dependiendo del ciclo y la disponibilidad de suscripciones."),
-
-    dlg("¿Cuántas sedes tiene la UPLA?",
-        "La UPLA tiene la sede central en Huancayo y filiales en Lima "
-        "(San Juan de Lurigancho y Jesús María), Chanchamayo (La Merced) "
-        "y Satipo. Todas en la región Junín excepto Lima."),
-
-    dlg("¿Cuál es la nota mínima para aprobar en la UPLA?",
-        "La nota mínima aprobatoria en la UPLA es 11 sobre 20 (sistema "
-        "vigesimal)."),
-    dlg("¿Cómo se evalúan los cursos?",
-        "La evaluación incluye: evaluación continua (prácticas, tareas, "
-        "exposiciones), evaluación parcial y evaluación final. Los pesos "
-        "los define cada docente según el sílabo."),
-
-    dlg("¿Qué es Nexo?",
-        "Nexo es una aplicación no oficial para estudiantes y docentes "
-        "de la UPLA. Reúne tus clases, calificaciones, pagos y Microsoft "
-        "Teams en un solo lugar. Fue creada por Alessandro Villogas "
-        "Gaspar de Auralix Studio."),
-    dlg("¿Nexo es oficial de la UPLA?",
-        "No, Nexo es un proyecto independiente. No está afiliado ni "
-        "respaldado oficialmente por la Universidad Peruana Los Andes. "
-        "Es un proyecto personal de Alessandro Villogas Gaspar."),
-    dlg("¿Nexo es gratis?",
-        "Sí, Nexo es completamente gratuita. No tiene publicidad, "
-        "compras integradas ni suscripciones."),
-    dlg("¿Cómo descargo Nexo?",
-        "Puedes descargar Nexo desde GitHub: "
-        "github.com/auralix-studio/nexo/releases. Está disponible "
-        "para Android y Windows."),
-    dlg("¿Puedo usar Nexo sin Lumen?",
-        "Sí, Lumen es completamente opcional. Puedes usar Nexo para "
-        "ver tu horario, notas y pagos sin activar el asistente."),
+        "privada fundada el 30 de diciembre de 1983 (Ley N 23757). "
+        "Sede principal en Huancayo, Junin."),
+    dlg("Cuando se fundo la UPLA?",
+        "La UPLA fue fundada el 30 de diciembre de 1983 por la Ley N 23757."),
+    dlg("Donde queda la UPLA?",
+        "Sede central: Av. Giraldez 231, Huancayo, Junin. Filiales en "
+        "Lima, Chanchamayo (La Merced) y Satipo."),
+    dlg("Cual es el lema de la UPLA?",
+        "El lema es Honor, ciencia y desarrollo."),
+    dlg("La UPLA esta licenciada?",
+        "Si, la UPLA esta licenciada por la SUNEDU desde 2019."),
+    dlg("Cuantas facultades tiene la UPLA?",
+        "Seis: Medicina Humana, Ciencias de la Salud, Ingenieria, "
+        "Derecho y Ciencias Politicas, Ciencias Administrativas y "
+        "Contables, y Educacion y Ciencias Humanas."),
+    dlg("Que carreras de ingenieria hay en la UPLA?",
+        "Ingenieria de Sistemas y Computacion, Civil, Industrial, "
+        "Mecanica Electrica y Ambiental. Todas 10 semestres."),
+    dlg("Cuanto dura Ingenieria de Sistemas?",
+        "10 semestres (5 anos). Titulo: Ingeniero de Sistemas y Computacion."),
+    dlg("Cuanto dura Medicina?",
+        "14 semestres mas internado y SERUMS. Titulo: Medico Cirujano."),
+    dlg("Cuanto dura Derecho?",
+        "12 semestres. Titulo: Abogado/a."),
+    dlg("Que carreras de salud ofrece la UPLA?",
+        "Enfermeria, Obstetricia, Tecnologia Medica, Odontologia, "
+        "Farmacia y Bioquimica, y Psicologia. La mayoria 10 semestres."),
+    dlg("Hay carreras de Administracion en la UPLA?",
+        "Si: Administracion y Contabilidad. Ambas 10 semestres."),
+    dlg("Como obtengo el grado de bachiller?",
+        "Es automatico al culminar el plan de estudios y los creditos. "
+        "Luego se tramita el diploma via SUNEDU."),
+    dlg("Como obtengo el titulo profesional?",
+        "Debes sustentar una tesis o trabajo de suficiencia profesional."),
+    dlg("Que es el FUT?",
+        "El Formulario Unico de Tramite es el documento estandar para "
+        "solicitudes formales en la UPLA."),
+    dlg("Como saco una constancia de matricula?",
+        "SIGMA -> Tramites -> Constancia. Tarda 1-3 dias habiles."),
+    dlg("Como retiro un curso?",
+        "FUT justificado antes de la primera evaluacion parcial. "
+        "Limite de 1-2 cursos por semestre."),
+    dlg("Puedo cambiarme de carrera dentro de la UPLA?",
+        "Si, es un traslado interno. Se solicita al inicio del periodo. "
+        "Minimo de creditos y convalidacion caso por caso."),
+    dlg("Que cursos llevo en el primer ciclo?",
+        "Comunicacion I, Matematica Basica, Filosofia, Metodologia del "
+        "Trabajo Universitario y Realidad Nacional."),
+    dlg("Que es Analisis Matematico y que prerequisito tiene?",
+        "Analisis Matematico I, II y III cubren calculo diferencial, "
+        "integral y vectorial. Son secuenciales: apruebas I para llevar II."),
+    dlg("Cuantos cursos se llevan por ciclo?",
+        "Ciclos 1-3: 5-7 cursos. Ciclos 4-7: 18-22 creditos. "
+        "Ciclos 8-10: 16-18 creditos mas practicas."),
+    dlg("Que es SIGMA?",
+        "SIGMA (sigma.upla.edu.pe) es el sistema academico de la UPLA. "
+        "Ahi ves matricula, notas, horarios y cuotas."),
+    dlg("Que es la Intranet de la UPLA?",
+        "La Intranet complementa SIGMA con pensiones, ranking y malla curricular."),
+    dlg("La biblioteca de la UPLA es virtual?",
+        "Tiene fisica en sede central y virtual 24/7 con credenciales SIGMA."),
+    dlg("Cual es la nota minima para aprobar en la UPLA?",
+        "11 sobre 20 (sistema vigesimal)."),
+    dlg("Como se evaluan los cursos?",
+        "Evaluacion continua, parcial y final. Pesos segun silabo del docente."),
+    dlg("Cuantas sedes tiene la UPLA?",
+        "Sede central en Huancayo mas filiales en Lima, Chanchamayo y Satipo."),
+    dlg("Que es Bienestar Universitario?",
+        "La oficina que brinda apoyo psicologico, tutoria y orientacion "
+        "sobre becas y servicios al estudiante."),
+    dlg("Que es Nexo?",
+        "Una app no oficial para estudiantes de la UPLA. Reune horario, "
+        "notas, pagos y Teams. Creada por Alessandro Villogas Gaspar."),
+    dlg("Como descargo Nexo?",
+        "Desde GitHub: github.com/auralix-studio/nexo/releases. "
+        "Disponible para Android y Windows."),
+    dlg("Puedo usar Nexo sin Lumen?",
+        "Si. Lumen es opcional. Puedes usar Nexo para horario, notas "
+        "y pagos sin activar el asistente."),
 ]
 
-print(f"[OK] Diálogos UPLA Q&A: {len(UPLA_QA)}")
+print(f"[OK] UPLA_QA: {len(UPLA_QA)} dialogos")
+
+
+# ═══════════════════════════════════════════════════════════
+#   DIALOGOS - APOYO EMOCIONAL
+# ═══════════════════════════════════════════════════════════
 
 EMOTIONAL_SUPPORT = [
-    dlg("Me siento estresado con los exámenes.",
-        "Te entiendo, la época de exámenes pesa. Respira: vamos por "
-        "partes. Dime qué curso te preocupa más y armemos juntos un plan "
-        "simple para repasarlo. No estás solo en esto."),
+    dlg("Me siento estresado con los examenes.",
+        "Te entiendo, la epoca de examenes pesa. Respira: vamos por "
+        "partes. Dime que curso te preocupa mas. No estas solo."),
     dlg("Estoy desanimado, creo que voy a jalar un curso.",
-        "Lamento que te sientas así. Un mal momento no define tu carrera. "
-        "Veamos qué se puede hacer: ¿en qué curso estás y qué notas te "
-        "faltan? A veces hay más margen del que parece."),
-    dlg("No sé si elegí bien mi carrera.",
-        "Es normal tener esas dudas, sobre todo al inicio. Date tiempo "
-        "para conocer mejor las materias que vienen. Si después de "
-        "pensarlo bien sientes que quieres cambiar, en la UPLA existe "
-        "el traslado interno. Lo importante es que la decisión sea "
-        "informada, no impulsiva."),
+        "Un mal momento no define tu carrera. Dime en que curso estas "
+        "y que notas te faltan. A veces hay mas margen del que parece."),
+    dlg("No se si elegi bien mi carrera.",
+        "Es normal tener esas dudas. Date tiempo para conocer las "
+        "materias. Si quieres cambiar, en la UPLA existe el traslado interno."),
     dlg("Me siento solo en la universidad.",
-        "Entiendo cómo te sientes. La universidad puede ser abrumadora, "
-        "especialmente si eres nuevo. Te sugiero participar en grupos de "
-        "estudio o actividades extracurriculares. También Bienestar "
-        "Universitario ofrece apoyo. Y recuerda, aquí estoy para lo "
-        "que necesites."),
+        "La universidad puede ser abrumadora. Bienestar Universitario "
+        "ofrece apoyo. Y aqui estoy para lo que necesites."),
     dlg("Estoy pensando en dejar la universidad.",
-        "Es una decisión grande. Antes de tomarla, te sugiero hablar con "
-        "Bienestar Universitario y con tu tutor académico. A veces una "
-        "pausa (retiro de semestre) puede ser mejor que dejarlo del todo. "
-        "¿Qué es lo que más te afecta?"),
+        "Es una decision grande. Habla con Bienestar Universitario. "
+        "A veces un retiro de semestre puede ser mejor que dejarlo del todo."),
     dlg("No me alcanza el dinero para la universidad.",
-        "Entiendo tu preocupación. Revisa si la UPLA tiene opciones de "
-        "becas, fraccionamiento de pagos o convenios. También puedes "
-        "consultar en Bienestar Universitario sobre opciones de apoyo "
-        "económico. El retiro de semestre sin devolución tiene plazos "
-        "específicos, así que infórmate pronto."),
+        "Consulta en Bienestar Universitario sobre becas y fraccionamiento. "
+        "Hay opciones de apoyo economico."),
     dlg("Tengo ansiedad por las exposiciones.",
-        "Es más común de lo que crees. Algunos consejos: prepara bien "
-        "tu tema, practica frente al espejo o con amigos, lleva notas "
-        "de apoyo, y recuerda que los profesores valoran tu esfuerzo. "
-        "La ansiedad disminuye con la práctica. Tú puedes."),
-    dlg("No entiendo una materia y me da vergüenza preguntar.",
-        "No deberías sentir vergüenza, preguntar es parte de aprender. "
-        "Si no te sientes cómodo en clase, acércate al profesor después, "
-        "busca tutorías, o forma un grupo de estudio. También puedes "
-        "buscar videos y recursos en la biblioteca virtual."),
-    dlg("Me llevo mal con un compañero de grupo.",
-        "Los trabajos en grupo pueden ser difíciles. Intenta comunicar "
-        "tus expectativas claramente y repartir las tareas por escrito. "
-        "Si el problema persiste, habla con el profesor. Lo importante "
-        "es no dejar que afecte tu rendimiento."),
+        "Es comun. Prepara el tema, practica con alguien y lleva notas. "
+        "La ansiedad baja con la practica. Tu puedes."),
     dlg("Me fue muy mal en un examen.",
-        "Un examen malo no define todo. Lo importante es entender qué "
-        "falló: ¿faltó tiempo de estudio, no entendiste el tema, o fue "
-        "estrés? Identifica el problema, habla con el profesor si puedes "
-        "y enfócate en las evaluaciones que faltan. Todavía hay margen."),
+        "Un examen malo no define todo. Identifica que fallo y enfocate "
+        "en las evaluaciones que faltan. Todavia hay margen."),
     dlg("Estoy orgulloso de mis notas.",
-        "¡Felicidades! Tu esfuerzo está dando resultados. Sigue así y "
-        "recuerda disfrutar del camino. Si necesitas algo, aquí estoy."),
+        "Felicidades! Tu esfuerzo esta dando resultados. Sigue asi."),
     dlg("Gracias por escucharme.",
-        "Para eso estoy. No tienes que enfrentar las cosas solo. "
-        "Siempre que necesites hablar o resolver algo, aquí me encuentras."),
+        "Para eso estoy. No tienes que enfrentar las cosas solo."),
+    dlg("Me cuesta concentrarme para estudiar.",
+        "Prueba estudiar en bloques de 25 minutos con descansos de 5 "
+        "(tecnica Pomodoro). Elimina distracciones. Quieres que "
+        "te ayude a organizar el tema?"),
+    dlg("Gracias Lumen.",
+        "Para eso estoy. Cuando me necesites, aqui voy a estar."),
 ]
 
-print(f"[OK] Diálogos APOYO EMOCIONAL: {len(EMOTIONAL_SUPPORT)}")
+print(f"[OK] EMOTIONAL_SUPPORT: {len(EMOTIONAL_SUPPORT)} dialogos")
+
+
+# ═══════════════════════════════════════════════════════════
+#   DIALOGOS - NEXO
+# ═══════════════════════════════════════════════════════════
 
 NEXO_DIALOGS = [
-    dlg("¿Cómo funciona Nexo?",
-        "Nexo se conecta directamente a SIGMA y la Intranet de la UPLA "
-        "usando tus credenciales institucionales. No hay servidores "
-        "intermediarios. Todo se almacena localmente en tu dispositivo."),
-    dlg("¿Nexo recoge mis datos?",
-        "No. Nexo no envía telemetría, no tiene publicidad, no recopila "
-        "estadísticas de uso. Tus datos se quedan en tu teléfono."),
-    dlg("¿Cómo activo a Lumen?",
-        "Toca el botón flotante en la esquina inferior derecha de la "
-        "pantalla principal. La primera vez te pedirá elegir una variante "
-        "(Ligero o Estándar) y descargar el modelo. Después de eso, "
-        "estaré listo para ayudarte."),
-    dlg("¿Qué modelo de Lumen debo elegir?",
-        "Si tu teléfono tiene 2-3 GB de RAM, elige Lumen Ligero (~290 MB). "
-        "Si tienes 4 GB o más, Lumen Estándar (~530 MB) te dará "
-        "respuestas de mejor calidad."),
-    dlg("¿Puedo cambiar el modelo de Lumen?",
-        "Sí, ve a Lumen -> Configuración -> 'Cambiar modelo'. Esto "
-        "eliminará la variante actual y descargará la nueva."),
-    dlg("¿Nexo funciona sin internet?",
-        "Parcialmente. Necesitas internet para iniciar sesión y "
-        "sincronizar datos. Después, los datos en caché están "
-        "disponibles sin conexión. Yo (Lumen) funciono completamente "
-        "sin internet después de la descarga inicial."),
-    dlg("¿Cómo reporto un error en Nexo?",
-        "Abre un issue en GitHub: github.com/auralix-studio/nexo/issues. "
-        "Incluye los pasos para reproducir el error, una captura de "
-        "pantalla y la versión de Nexo."),
-    dlg("¿En qué plataformas funciona Nexo?",
-        "Nexo está disponible para Android (APK descargable), Windows "
-        "(ZIP portable o instalable), y tiene versión web demo. También "
-        "compila para iOS, macOS y Linux."),
-    dlg("¿Nexo tiene notificaciones?",
-        "Sí. Nexo programa notificaciones locales para: recordatorios de "
-        "clases (15 minutos antes), avisos de cuotas por vencer (1 día "
-        "antes) y detección de calificaciones nuevas."),
-    dlg("¿Qué es el patrón Resolver de Nexo?",
-        "El patrón Resolver permite que Nexo busque la información en "
-        "SIGMA primero. Si SIGMA no responde, automáticamente usa la "
-        "Intranet como fuente alternativa. Así la app sigue funcionando "
-        "aunque un sistema esté caído."),
+    dlg("Como funciona Nexo?",
+        "Nexo se conecta directamente a SIGMA e Intranet con tus "
+        "credenciales. Sin servidores intermediarios. Todo local."),
+    dlg("Nexo recoge mis datos?",
+        "No. Sin telemetria, sin publicidad, sin estadisticas. "
+        "Tus datos se quedan en tu telefono."),
+    dlg("Como activo a Lumen?",
+        "Toca el boton flotante en la esquina inferior derecha. "
+        "La primera vez elige Ligero o Estandar y descarga el modelo."),
+    dlg("Que modelo de Lumen debo elegir?",
+        "Con 2-3 GB de RAM elige Lumen Ligero (~290 MB). "
+        "Con 4 GB o mas, Lumen Estandar (~530 MB) da mejores respuestas."),
+    dlg("Nexo funciona sin internet?",
+        "Parcialmente. Necesitas internet para sincronizar. Los datos "
+        "en cache se usan sin conexion. Lumen funciona sin internet."),
+    dlg("Como reporto un error en Nexo?",
+        "GitHub: github.com/auralix-studio/nexo/issues. "
+        "Incluye pasos, captura y version de Nexo."),
+    dlg("En que plataformas funciona Nexo?",
+        "Android (APK), Windows (ZIP portable) y web demo. "
+        "Tambien compila para iOS, macOS y Linux."),
+    dlg("Nexo tiene notificaciones?",
+        "Si. Recordatorios de clases (15 min antes), avisos de cuotas "
+        "(1 dia antes) y deteccion de notas nuevas."),
+    dlg("Que es el patron Resolver de Nexo?",
+        "Si SIGMA no responde, Nexo usa automaticamente la Intranet. "
+        "Asi la app sigue funcionando."),
+    dlg("Puedo cambiar el modelo de Lumen?",
+        "Si. Lumen -> Configuracion -> Cambiar modelo."),
 ]
 
-print(f"[OK] Diálogos NEXO: {len(NEXO_DIALOGS)}")
+print(f"[OK] NEXO_DIALOGS: {len(NEXO_DIALOGS)} dialogos")
+
+
+# ═══════════════════════════════════════════════════════════
+#   PARAFRASEO Y CORPUS
+# ═══════════════════════════════════════════════════════════
 
 PARAPHRASE_PREFIX = [
     "", "Oye, ", "Una consulta: ", "Disculpa, ", "Hola Lumen, ",
-    "Quería saber, ", "Dime, ", "Por favor, ", "Hey, ",
-    "Tengo una duda, ", "Oye Lumen, ", "Me puedes decir, ",
+    "Queria saber, ", "Dime, ", "Por favor, ", "Hey, ",
+    "Tengo una duda, ", "Me puedes decir, ", "Necesito saber, ",
+    "A ver, ", "Cuentame, ",
 ]
 
+
 def paraphrase(turns: list, factor: int) -> list:
-    """Genera variantes con prefijos para cada diálogo."""
+    """Genera variantes con prefijos."""
     out = []
     for t in turns:
         out.append(t)
@@ -913,17 +1001,17 @@ def paraphrase(turns: list, factor: int) -> list:
                 out.append(t)
     return out
 
+
 def load_spanish_base(n_docs: int) -> list:
-    """Descarga artículos de Wikipedia en español para base lingüística."""
+    """Wikipedia en espanol - base linguistica minima."""
     if n_docs <= 0:
         return []
     try:
         from datasets import load_dataset
     except ImportError:
-        print("[WARN] 'datasets' no está instalado. Saltando español base.")
+        print("[WARN] datasets no instalado. Saltando Wikipedia.")
         return []
-
-    print(f" Descargando {n_docs:,} artículos de Wikipedia ES (streaming)…")
+    print(f"  Descargando {n_docs:,} articulos de Wikipedia ES...")
     ds = load_dataset("wikimedia/wikipedia", "20231101.es",
                       split="train", streaming=True)
     docs = []
@@ -932,56 +1020,64 @@ def load_spanish_base(n_docs: int) -> list:
             break
         t = (row.get("text") or "").strip()
         if len(t) > 200:
-            docs.append(t[:4000])
-        if (i + 1) % 5000 == 0:
-            print(f"  … {i+1:,} artículos procesados")
-    print(f"[OK] Español base: {len(docs):,} documentos cargados")
+            docs.append(t[:3000])
+        if (i + 1) % 1000 == 0:
+            print(f"  ... {i+1:,} articulos")
+    print(f"[OK] Wikipedia ES: {len(docs):,} docs")
     return docs
 
+
 def build_corpus() -> str:
-    """Construye el corpus completo de entrenamiento."""
+    """Construye el corpus de entrenamiento."""
     print("\n" + "=" * 60)
-    print("  CONSTRUYENDO CORPUS DE ENTRENAMIENTO")
+    print("  CONSTRUYENDO CORPUS")
     print("=" * 60)
 
     parts = []
 
+    # 1) Base linguistica minima
     parts += load_spanish_base(cfg.N_WIKIPEDIA_DOCS)
+    print(f"  Wikipedia: {len(parts):,} bloques")
 
+    # 2) KB UPLA/Nexo/Lumen (alta prioridad, muchas repeticiones)
     for _ in range(cfg.KB_REPEAT):
         parts += ALL_KB
-    print(f"[OK] KB UPLA: {len(ALL_KB)} docs × {cfg.KB_REPEAT} = "
-          f"{len(ALL_KB) * cfg.KB_REPEAT} bloques")
+    print(f"[OK] KB UPLA: {len(ALL_KB)} x {cfg.KB_REPEAT} = {len(ALL_KB) * cfg.KB_REPEAT} bloques")
 
-    all_dialogs = PERSONA + SKILLS
+    # 3) Dialogos
+    all_dialogs = list(PERSONA) + list(SKILLS)
+    all_dialogs += paraphrase(FUNCTION_DIALOGS, factor=3)
+    all_dialogs += paraphrase(CLARIFICATION_DIALOGS, factor=3)
     all_dialogs += paraphrase(UPLA_QA, factor=cfg.PARAPHRASE_FACTOR)
     all_dialogs += paraphrase(EMOTIONAL_SUPPORT, factor=cfg.PARAPHRASE_FACTOR)
     all_dialogs += paraphrase(NEXO_DIALOGS, factor=cfg.PARAPHRASE_FACTOR)
 
-    print(f"[OK] Diálogos totales (con parafraseo): {len(all_dialogs)}")
+    print(f"[OK] Dialogos con parafraseo: {len(all_dialogs):,}")
 
     for _ in range(cfg.DIALOG_REPEAT):
         random.shuffle(all_dialogs)
         parts += all_dialogs
 
-    print(f"[OK] Diálogos × {cfg.DIALOG_REPEAT} repeticiones = "
-          f"{len(all_dialogs) * cfg.DIALOG_REPEAT} bloques")
+    print(f"[OK] Dialogos x {cfg.DIALOG_REPEAT} = {len(all_dialogs) * cfg.DIALOG_REPEAT:,} bloques")
 
     random.shuffle(parts)
     corpus = "\n\n".join(parts)
-
     cfg.CORPUS_FILE.write_text(corpus, encoding="utf-8")
     mb = len(corpus.encode("utf-8")) / 1e6
-    print(f"\n{'' * 50}")
-    print(f"  Corpus escrito -> {cfg.CORPUS_FILE}")
-    print(f"  Tamaño: {mb:.1f} MB  ·  {len(parts):,} bloques")
-    print(f"{'' * 50}\n")
+    print(f"\n  Corpus -> {cfg.CORPUS_FILE}")
+    print(f"  Tamano: {mb:.1f} MB, {len(parts):,} bloques")
+    print("-" * 60 + "\n")
     return corpus
+
 
 corpus_text = build_corpus()
 
+
+# ═══════════════════════════════════════════════════════════
+#   TOKENIZADOR
+# ═══════════════════════════════════════════════════════════
+
 def train_tokenizer(corpus: str):
-    """Entrena un tokenizador SentencePiece BPE sobre el corpus."""
     print("\n" + "=" * 60)
     print("  ENTRENANDO TOKENIZADOR")
     print("=" * 60)
@@ -994,8 +1090,6 @@ def train_tokenizer(corpus: str):
     sp_input = cfg.WORK_DIR / "sp_input.txt"
     sp_input.write_text("\n".join(lines), encoding="utf-8")
 
-    user_defined = ",".join(SPECIAL_TOKENS)
-
     spm.SentencePieceTrainer.train(
         input=str(sp_input),
         model_prefix=str(cfg.TOKENIZER_PREFIX),
@@ -1003,11 +1097,11 @@ def train_tokenizer(corpus: str):
         model_type="bpe",
         character_coverage=0.9995,
         num_threads=os.cpu_count() or 4,
-        pad_id=0,                
-        bos_id=1,                
-        eos_id=2,                
+        pad_id=0,
+        bos_id=1,
+        eos_id=2,
         unk_id=3,
-        user_defined_symbols=user_defined,
+        user_defined_symbols=",".join(SPECIAL_TOKENS),
         byte_fallback=True,
         split_digits=True,
         max_sentence_length=16384,
@@ -1017,283 +1111,334 @@ def train_tokenizer(corpus: str):
 
     sp = spm.SentencePieceProcessor()
     sp.load(str(cfg.TOKENIZER_PREFIX) + ".model")
-
-    print(f"[OK] Tokenizador entrenado: {sp.get_piece_size()} tokens")
-    print(f"  Modelo guardado en: {cfg.TOKENIZER_PREFIX}.model")
-
+    print(f"[OK] Tokenizador: {sp.get_piece_size()} tokens")
     for tok in SPECIAL_TOKENS:
-        idx = sp.piece_to_id(tok)
-        print(f"  {tok} -> id {idx}")
+        print(f"  {tok} -> id {sp.piece_to_id(tok)}")
 
-    test = "Hola Lumen, ¿cuándo es mi próxima clase?"
-    encoded = sp.encode(test)
-    decoded = sp.decode(encoded)
+    test = "Hola Lumen, cuando es mi proxima clase?"
     print(f"\n  Test: '{test}'")
-    print(f"  Tokens: {encoded[:20]}… ({len(encoded)} tokens)")
-    print(f"  Decoded: '{decoded}'")
+    enc = sp.encode(test)
+    print(f"  Tokens: {enc[:15]} ({len(enc)} tokens)")
+    print(f"  Decoded: '{sp.decode(enc)}'")
 
     sp_input.unlink(missing_ok=True)
-
     return sp
+
 
 tokenizer = train_tokenizer(corpus_text)
 
-PAD_ID   = tokenizer.piece_to_id(TOK_PAD)
-BOS_ID   = tokenizer.piece_to_id(TOK_BOS)
-EOS_ID   = tokenizer.piece_to_id(TOK_EOS)
-USER_ID  = tokenizer.piece_to_id(TOK_USER)
-LUMEN_ID = tokenizer.piece_to_id(TOK_LUMEN)
-END_ID   = tokenizer.piece_to_id(TOK_END)
+PAD_ID      = tokenizer.piece_to_id(TOK_PAD)
+BOS_ID      = tokenizer.piece_to_id(TOK_BOS)
+EOS_ID      = tokenizer.piece_to_id(TOK_EOS)
+USER_ID     = tokenizer.piece_to_id(TOK_USER)
+LUMEN_ID    = tokenizer.piece_to_id(TOK_LUMEN)
+END_ID      = tokenizer.piece_to_id(TOK_END)
+THINK_ID    = tokenizer.piece_to_id(TOK_THINK)
+ENDTHINK_ID = tokenizer.piece_to_id(TOK_ENDTHINK)
+CALL_ID     = tokenizer.piece_to_id(TOK_CALL)
+RESULT_ID   = tokenizer.piece_to_id(TOK_RESULT)
 
-print(f"\nIDs especiales: PAD={PAD_ID} BOS={BOS_ID} EOS={EOS_ID} "
-      f"USER={USER_ID} LUMEN={LUMEN_ID} END={END_ID}")
+print(f"\nIDs: PAD={PAD_ID} BOS={BOS_ID} EOS={EOS_ID}")
+print(f"     USER={USER_ID} LUMEN={LUMEN_ID} END={END_ID}")
+print(f"     THINK={THINK_ID} /THINK={ENDTHINK_ID}")
+print(f"     CALL={CALL_ID} RESULT={RESULT_ID}")
+
+
+# ═══════════════════════════════════════════════════════════
+#   DATASET con mascara de respuesta (response-only loss)
+# ═══════════════════════════════════════════════════════════
 
 class LumenDataset(Dataset):
-    """Dataset que tokeniza el corpus y lo divide en secuencias de largo fijo."""
+    """
+    Mejoras sobre v1.x:
+    1. Divide por bloques logicos (no arbitrariamente).
+    2. Mascara de respuesta: solo los tokens de Lumen contribuyen a la loss.
+    """
 
     def __init__(self, corpus_path: Path, tokenizer, seq_len: int):
-        print(" Tokenizando corpus completo…")
-        text = corpus_path.read_text(encoding="utf-8")
+        print("  Tokenizando corpus por bloques logicos...")
+        text   = corpus_path.read_text(encoding="utf-8")
+        blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
 
-        all_ids = tokenizer.encode(text)
-        print(f"  Corpus tokenizado: {len(all_ids):,} tokens")
-
-        all_ids = [BOS_ID] + all_ids + [EOS_ID]
-
-        self.seq_len = seq_len
+        self.seq_len   = seq_len
         self.sequences = []
+        self.masks     = []
 
-        stride = seq_len
-        for i in range(0, len(all_ids) - seq_len, stride):
-            chunk = all_ids[i:i + seq_len + 1]
-            if len(chunk) == seq_len + 1:
-                self.sequences.append(chunk)
+        for block in blocks:
+            block_ids = tokenizer.encode(block)
+            if not block_ids:
+                continue
+            full = [BOS_ID] + block_ids + [EOS_ID]
 
-        print(f"  Secuencias de entrenamiento: {len(self.sequences):,} "
-              f"(largo={seq_len})")
+            if len(full) <= seq_len + 1:
+                pad_len = (seq_len + 1) - len(full)
+                padded  = full + [PAD_ID] * pad_len
+                self.sequences.append(padded)
+                self.masks.append(self._make_mask(padded))
+            else:
+                stride = seq_len // 2
+                i = 0
+                while i < len(full):
+                    chunk = full[i:i + seq_len + 1]
+                    if len(chunk) < seq_len + 1:
+                        chunk = chunk + [PAD_ID] * ((seq_len + 1) - len(chunk))
+                    self.sequences.append(chunk)
+                    self.masks.append(self._make_mask(chunk))
+                    if i + seq_len + 1 >= len(full):
+                        break
+                    i += stride
+
+        print(f"  Secuencias: {len(self.sequences):,} (largo={seq_len})")
+
+    def _make_mask(self, seq: list) -> list:
+        """
+        True para tokens de la respuesta de Lumen: [LUMEN]...[END]
+        Excluye los tokens de entrada del usuario y el bloque de resultado [RESULT]...[RESULT].
+        """
+        mask        = [False] * len(seq)
+        in_response = False
+        in_result   = False
+        for i, tok in enumerate(seq):
+            if tok == LUMEN_ID:
+                in_response = True
+                continue
+            if tok == RESULT_ID:
+                if not in_result:
+                    in_result   = True
+                    in_response = False
+                else:
+                    in_result   = False
+                    in_response = True
+                continue
+            if tok == END_ID:
+                mask[i]     = True
+                in_response = False
+                continue
+            if in_response and not in_result:
+                mask[i] = True
+        return mask
 
     def __len__(self):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        seq = self.sequences[idx]
+        seq  = self.sequences[idx]
+        mask = self.masks[idx]
         x = torch.tensor(seq[:-1], dtype=torch.long)
-        y = torch.tensor(seq[1:], dtype=torch.long)
-        return x, y
+        y = torch.tensor(seq[1:],  dtype=torch.long)
+        m = torch.tensor(mask[1:], dtype=torch.bool)
+        return x, y, m
+
 
 dataset = LumenDataset(cfg.CORPUS_FILE, tokenizer, cfg.MAX_SEQ_LEN)
 dataloader = DataLoader(
     dataset,
-    batch_size=cfg.BATCH_SIZE,
-    shuffle=True,
-    num_workers=0,
-    pin_memory=True,
-    drop_last=True,
+    batch_size  = cfg.BATCH_SIZE,
+    shuffle     = True,
+    num_workers = 0,
+    pin_memory  = True,
+    drop_last   = True,
 )
 
 print(f"[OK] DataLoader: {len(dataloader):,} batches de {cfg.BATCH_SIZE}")
-total_tokens = len(dataset) * cfg.MAX_SEQ_LEN
-print(f"  Tokens totales por época: {total_tokens:,}")
+print(f"  Tokens por epoca: {len(dataset) * cfg.MAX_SEQ_LEN:,}")
+
+
+# ═══════════════════════════════════════════════════════════
+#   ARQUITECTURA DEL MODELO
+# ═══════════════════════════════════════════════════════════
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (más estable que LayerNorm)."""
-
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.eps = eps
+        self.eps    = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
         rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
         return x / rms * self.weight
 
-def precompute_rope_freqs(dim: int, max_seq_len: int, theta: float = 10000.0):
-    """Pre-computa las frecuencias para Rotary Position Embeddings."""
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-    t = torch.arange(max_seq_len).float()
-    freqs = torch.outer(t, freqs)
-    cos_freqs = torch.cos(freqs)
-    sin_freqs = torch.sin(freqs)
-    return cos_freqs, sin_freqs
 
-def apply_rope(x, cos_freqs, sin_freqs):
-    """Aplica RoPE a un tensor de queries o keys."""
-    d = x.shape[-1]
-    x1, x2 = x[..., :d//2], x[..., d//2:]
-    seq_len = x.shape[2]
-    cos_f = cos_freqs[:seq_len].unsqueeze(0).unsqueeze(0).to(x.device)
-    sin_f = sin_freqs[:seq_len].unsqueeze(0).unsqueeze(0).to(x.device)
-    out1 = x1 * cos_f - x2 * sin_f
-    out2 = x2 * cos_f + x1 * sin_f
-    return torch.cat([out1, out2], dim=-1)
+def precompute_rope_freqs(dim: int, max_seq_len: int, theta: float = 10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    t     = torch.arange(max_seq_len).float()
+    freqs = torch.outer(t, freqs)
+    return torch.cos(freqs), torch.sin(freqs)
+
+
+def apply_rope(x, cos_f, sin_f):
+    d    = x.shape[-1]
+    x1   = x[..., :d // 2]
+    x2   = x[..., d // 2:]
+    T    = x.shape[2]
+    cos  = cos_f[:T].unsqueeze(0).unsqueeze(0).to(x.device)
+    sin  = sin_f[:T].unsqueeze(0).unsqueeze(0).to(x.device)
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
 
 class MultiHeadAttention(nn.Module):
-    """Multi-Head Self-Attention con RoPE y máscara causal."""
-
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+    def __init__(self, d_model, n_heads, dropout=0.1):
         super().__init__()
         assert d_model % n_heads == 0
-        self.n_heads = n_heads
+        self.n_heads  = n_heads
         self.head_dim = d_model // n_heads
-
         self.wq = nn.Linear(d_model, d_model, bias=False)
         self.wk = nn.Linear(d_model, d_model, bias=False)
         self.wv = nn.Linear(d_model, d_model, bias=False)
         self.wo = nn.Linear(d_model, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        self.drop = nn.Dropout(dropout)
 
-    def forward(self, x, cos_freqs, sin_freqs, mask=None):
+    def forward(self, x, cos_f, sin_f, mask=None):
         B, T, C = x.shape
-
         q = self.wq(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.wk(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.wv(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-
-        q = apply_rope(q, cos_freqs, sin_freqs)
-        k = apply_rope(k, cos_freqs, sin_freqs)
-
-        scale = math.sqrt(self.head_dim)
-        attn = torch.matmul(q, k.transpose(-2, -1)) / scale
-
+        q = apply_rope(q, cos_f, sin_f)
+        k = apply_rope(k, cos_f, sin_f)
+        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
-            attn = attn.masked_fill(mask == 0, float('-inf'))
-
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-
-        out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
+            attn = attn.masked_fill(mask == 0, float("-inf"))
+        attn = self.drop(F.softmax(attn, dim=-1))
+        out  = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, T, C)
         return self.wo(out)
 
-class SwiGLU(nn.Module):
-    """SwiGLU activation (usado en LLaMA, Gemma, etc)."""
 
-    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_ff, dropout=0.1):
         super().__init__()
-        self.w1 = nn.Linear(d_model, d_ff, bias=False)
-        self.w2 = nn.Linear(d_ff, d_model, bias=False)
-        self.w3 = nn.Linear(d_model, d_ff, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        self.w1   = nn.Linear(d_model, d_ff, bias=False)
+        self.w2   = nn.Linear(d_ff, d_model, bias=False)
+        self.w3   = nn.Linear(d_model, d_ff, bias=False)
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+        return self.drop(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+
 
 class TransformerBlock(nn.Module):
-    """Un bloque Transformer con Pre-Norm (RMSNorm -> Atención -> RMSNorm -> FFN)."""
-
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float):
+    def __init__(self, d_model, n_heads, d_ff, dropout):
         super().__init__()
         self.attn_norm = RMSNorm(d_model)
-        self.attn = MultiHeadAttention(d_model, n_heads, dropout)
-        self.ffn_norm = RMSNorm(d_model)
-        self.ffn = SwiGLU(d_model, d_ff, dropout)
+        self.attn      = MultiHeadAttention(d_model, n_heads, dropout)
+        self.ffn_norm  = RMSNorm(d_model)
+        self.ffn       = SwiGLU(d_model, d_ff, dropout)
 
-    def forward(self, x, cos_freqs, sin_freqs, mask=None):
-
-        x = x + self.attn(self.attn_norm(x), cos_freqs, sin_freqs, mask)
+    def forward(self, x, cos_f, sin_f, mask=None):
+        x = x + self.attn(self.attn_norm(x), cos_f, sin_f, mask)
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
+
+def masked_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    pad_id: int,
+    response_mask: Optional[torch.Tensor] = None,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """
+    Cross-entropy con:
+    - Ignorar tokens de padding.
+    - Ignorar tokens fuera de la respuesta de Lumen (response_mask).
+    - Label smoothing.
+    """
+    B, T, V = logits.shape
+    if label_smoothing > 0.0:
+        log_probs = F.log_softmax(logits, dim=-1)
+        with torch.no_grad():
+            smooth = torch.full_like(log_probs, label_smoothing / (V - 1))
+            smooth.scatter_(-1, targets.unsqueeze(-1).clamp(min=0),
+                            1.0 - label_smoothing)
+        per_token = -(smooth * log_probs).sum(-1)
+    else:
+        per_token = F.cross_entropy(
+            logits.view(-1, V), targets.view(-1),
+            ignore_index=pad_id, reduction="none",
+        ).view(B, T)
+
+    ignore = targets == pad_id
+    if response_mask is not None:
+        ignore = ignore | ~response_mask
+    per_token = per_token.masked_fill(ignore, 0.0)
+    return per_token.sum() / (~ignore).sum().clamp(min=1)
+
+
 class LumenModel(nn.Module):
-    """
-    Lumen — Modelo de lenguaje tipo GPT (decoder-only Transformer).
+    """Lumen v2.0 - GPT decoder-only con RoPE, RMSNorm y SwiGLU."""
 
-    Diseñado para ejecutarse en dispositivos móviles después de cuantización.
-    Arquitectura inspirada en Gemma/LLaMA: RoPE, RMSNorm, SwiGLU, Pre-Norm.
-    """
-
-    def __init__(
-        self,
-        vocab_size: int,
-        d_model: int = 512,
-        n_heads: int = 8,
-        n_layers: int = 8,
-        d_ff: int = 2048,
-        max_seq_len: int = 512,
-        dropout: float = 0.1,
-    ):
+    def __init__(self, vocab_size, d_model=512, n_heads=8, n_layers=8,
+                 d_ff=2048, max_seq_len=512, dropout=0.1):
         super().__init__()
-        self.d_model = d_model
+        self.d_model     = d_model
         self.max_seq_len = max_seq_len
-
-        self.token_emb = nn.Embedding(vocab_size, d_model, padding_idx=0)
-        self.dropout = nn.Dropout(dropout)
-
-        self.layers = nn.ModuleList([
+        self.token_emb   = nn.Embedding(vocab_size, d_model, padding_idx=0)
+        self.dropout     = nn.Dropout(dropout)
+        self.layers      = nn.ModuleList([
             TransformerBlock(d_model, n_heads, d_ff, dropout)
             for _ in range(n_layers)
         ])
-
-        self.norm = RMSNorm(d_model)
+        self.norm   = RMSNorm(d_model)
         self.output = nn.Linear(d_model, vocab_size, bias=False)
+        self.output.weight = self.token_emb.weight  # weight tying
 
-        self.output.weight = self.token_emb.weight
-
-        cos_freqs, sin_freqs = precompute_rope_freqs(
-            d_model // n_heads, max_seq_len
-        )
-        self.register_buffer("cos_freqs", cos_freqs)
-        self.register_buffer("sin_freqs", sin_freqs)
-
+        cos_f, sin_f = precompute_rope_freqs(d_model // n_heads, max_seq_len)
+        self.register_buffer("cos_freqs", cos_f)
+        self.register_buffer("sin_freqs", sin_f)
         self.apply(self._init_weights)
 
         n_params = sum(p.numel() for p in self.parameters())
         print(f"\n{'=' * 60}")
-        print(f"  MODELO LUMEN INICIALIZADO")
-        print(f"{'=' * 60}")
-        print(f"  Parámetros: {n_params:,} ({n_params/1e6:.1f}M)")
-        print(f"  d_model={d_model}, n_heads={n_heads}, n_layers={n_layers}")
-        print(f"  d_ff={d_ff}, max_seq={max_seq_len}, vocab={vocab_size}")
+        print(f"  LUMEN v2.0 - {n_params/1e6:.1f}M parametros")
+        print(f"  d_model={d_model} n_heads={n_heads} n_layers={n_layers}")
+        print(f"  d_ff={d_ff} max_seq={max_seq_len} vocab={vocab_size}")
         print(f"{'=' * 60}\n")
 
-    def _init_weights(self, module):
-        """Inicialización estándar para Transformers."""
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.padding_idx is not None:
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, 0.0, 0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, 0.0, 0.02)
+            if m.padding_idx is not None:
                 with torch.no_grad():
-                    module.weight[module.padding_idx].fill_(0)
+                    m.weight[m.padding_idx].fill_(0)
 
-    def forward(self, x, targets=None):
+    def forward(self, x, targets=None, response_mask=None):
         B, T = x.shape
-        assert T <= self.max_seq_len, f"Secuencia {T} > max {self.max_seq_len}"
-
+        assert T <= self.max_seq_len
         mask = torch.tril(torch.ones(T, T, device=x.device)).unsqueeze(0).unsqueeze(0)
-
-        h = self.dropout(self.token_emb(x))
-
+        h    = self.dropout(self.token_emb(x))
         for layer in self.layers:
             h = layer(h, self.cos_freqs, self.sin_freqs, mask)
-
-        h = self.norm(h)
-        logits = self.output(h)
-
-        loss = None
+        logits = self.output(self.norm(h))
+        loss   = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=PAD_ID,
+            loss = masked_cross_entropy(
+                logits, targets,
+                pad_id=PAD_ID,
+                response_mask=response_mask,
+                label_smoothing=cfg.LABEL_SMOOTHING,
             )
-
         return logits, loss
 
+
 model = LumenModel(
-    vocab_size=tokenizer.get_piece_size(),
-    d_model=cfg.D_MODEL,
-    n_heads=cfg.N_HEADS,
-    n_layers=cfg.N_LAYERS,
-    d_ff=cfg.D_FF,
-    max_seq_len=cfg.MAX_SEQ_LEN,
-    dropout=cfg.DROPOUT,
+    vocab_size  = tokenizer.get_piece_size(),
+    d_model     = cfg.D_MODEL,
+    n_heads     = cfg.N_HEADS,
+    n_layers    = cfg.N_LAYERS,
+    d_ff        = cfg.D_FF,
+    max_seq_len = cfg.MAX_SEQ_LEN,
+    dropout     = cfg.DROPOUT,
 ).to(DEVICE)
 
-def get_lr(step: int, warmup: int, max_steps: int, max_lr: float, min_lr: float = 1e-5):
-    """Cosine schedule con warmup lineal."""
+
+# ═══════════════════════════════════════════════════════════
+#   OPTIMIZADOR + SCHEDULER
+# ═══════════════════════════════════════════════════════════
+
+def get_lr(step, warmup, max_steps, max_lr, min_lr=1e-5):
     if step < warmup:
         return max_lr * (step + 1) / warmup
     if step >= max_steps:
@@ -1301,208 +1446,194 @@ def get_lr(step: int, warmup: int, max_steps: int, max_lr: float, min_lr: float 
     progress = (step - warmup) / (max_steps - warmup)
     return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
-decay_params = []
-no_decay_params = []
-for name, param in model.named_parameters():
-    if param.requires_grad:
-        if param.dim() >= 2:
-            decay_params.append(param)
-        else:
-            no_decay_params.append(param)
 
-optimizer = torch.optim.AdamW([
-    {"params": decay_params, "weight_decay": cfg.WEIGHT_DECAY},
-    {"params": no_decay_params, "weight_decay": 0.0},
-], lr=cfg.LEARNING_RATE, betas=(0.9, 0.95), eps=1e-8)
+decay_p, no_decay_p = [], []
+for name, p in model.named_parameters():
+    if p.requires_grad:
+        (decay_p if p.dim() >= 2 else no_decay_p).append(p)
 
+optimizer = torch.optim.AdamW(
+    [{"params": decay_p, "weight_decay": cfg.WEIGHT_DECAY},
+     {"params": no_decay_p, "weight_decay": 0.0}],
+    lr=cfg.LEARNING_RATE, betas=(0.9, 0.95), eps=1e-8,
+)
 scaler = GradScaler()
 
-print(f"[OK] Optimizador: AdamW (lr={cfg.LEARNING_RATE}, wd={cfg.WEIGHT_DECAY})")
-print(f"  Parámetros con decay: {sum(p.numel() for p in decay_params):,}")
-print(f"  Parámetros sin decay: {sum(p.numel() for p in no_decay_params):,}")
-print(f"  Warmup: {cfg.WARMUP_STEPS} pasos | Total: {cfg.MAX_STEPS} pasos")
-print(f"  Gradient accumulation: {cfg.GRAD_ACCUM_STEPS} pasos")
+print(f"[OK] AdamW | lr={cfg.LEARNING_RATE} | wd={cfg.WEIGHT_DECAY}")
+print(f"  Warmup: {cfg.WARMUP_STEPS} | Total: {cfg.MAX_STEPS}")
 print(f"  Batch efectivo: {cfg.BATCH_SIZE * cfg.GRAD_ACCUM_STEPS}")
+print(f"  Label smoothing: {cfg.LABEL_SMOOTHING} | Response-only loss: ON")
+
+
+# ═══════════════════════════════════════════════════════════
+#   GENERACION
+# ═══════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def generate(
-    model: LumenModel,
-    tokenizer,
-    prompt: str,
-    max_tokens: int = 256,
-    temperature: float = 0.7,
-    top_k: int = 50,
-    top_p: float = 0.9,
-) -> str:
-    """Genera texto a partir de un prompt."""
+def generate(model, tokenizer, prompt, max_tokens=200,
+             temperature=0.7, top_k=50, top_p=0.9):
     model.eval()
-    ids = tokenizer.encode(prompt)
-    ids = [BOS_ID] + ids
+    ids       = [BOS_ID] + tokenizer.encode(prompt)
     input_ids = torch.tensor([ids], dtype=torch.long, device=DEVICE)
 
     for _ in range(max_tokens):
         if input_ids.shape[1] > model.max_seq_len:
             input_ids = input_ids[:, -model.max_seq_len:]
-
         logits, _ = model(input_ids)
-        logits = logits[:, -1, :] / temperature
+        logits    = logits[:, -1, :] / max(temperature, 1e-6)
 
         if top_k > 0:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = float('-inf')
+            logits[logits < v[:, [-1]]] = float("-inf")
 
         if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            probs = F.softmax(sorted_logits, dim=-1)
-            cumulative = torch.cumsum(probs, dim=-1)
-            mask = cumulative - probs > top_p
-            sorted_logits[mask] = float('-inf')
-            logits = sorted_logits.scatter(1, sorted_indices, sorted_logits)
+            sl, si = torch.sort(logits, descending=True)
+            probs  = F.softmax(sl, dim=-1)
+            cumul  = torch.cumsum(probs, dim=-1)
+            sl[(cumul - probs) > top_p] = float("-inf")
+            logits = sl.scatter(1, si, sl)
 
-        probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-
-        if next_token.item() in (EOS_ID, END_ID):
+        next_tok = torch.multinomial(F.softmax(logits, dim=-1), 1)
+        if next_tok.item() in (EOS_ID, END_ID):
             break
+        input_ids = torch.cat([input_ids, next_tok], dim=1)
 
-        input_ids = torch.cat([input_ids, next_token], dim=1)
+    return tokenizer.decode(input_ids[0].tolist()[len(ids):])
 
-    output_ids = input_ids[0].tolist()
-    output_ids = output_ids[len(ids):]
-    return tokenizer.decode(output_ids)
 
 EVAL_PROMPTS = [
-    f"{TOK_USER} ¿Quién eres? {TOK_LUMEN}",
-    f"{TOK_USER} ¿Qué es la UPLA? {TOK_LUMEN}",
-    f"{TOK_USER} ¿Quién creó Nexo? {TOK_LUMEN}",
-    f"{TOK_USER} ¿Cuántas facultades tiene la UPLA? {TOK_LUMEN}",
-    f"{TOK_USER} ¿Cómo saco una constancia de matrícula? {TOK_LUMEN}",
-    f"{TOK_USER} Me siento estresado con los exámenes. {TOK_LUMEN}",
-    f"{TOK_USER} ¿Cuánto es 15% de 2750? {TOK_LUMEN}",
-    f"{TOK_USER} ¿Nexo envía mis datos a internet? {TOK_LUMEN}",
-    f"{TOK_USER} ¿Qué es Auralix Studio? {TOK_LUMEN}",
-    f"{TOK_USER} ¿Cuánto dura Ingeniería de Sistemas? {TOK_LUMEN}",
+    f"{TOK_USER} Quien eres? {TOK_LUMEN}",
+    f"{TOK_USER} Que es la UPLA? {TOK_LUMEN}",
+    f"{TOK_USER} Cuando tengo clases hoy? {TOK_LUMEN}",
+    f"{TOK_USER} Cuanto debo de cuotas? {TOK_LUMEN}",
+    f"{TOK_USER} Cual es mi promedio? {TOK_LUMEN}",
+    f"{TOK_USER} Tengo notas 14, 16 y 11. Cual es mi promedio? {TOK_LUMEN}",
+    f"{TOK_USER} Cuanto necesito en el final si llevo 14 y vale 70%? {TOK_LUMEN}",
+    f"{TOK_USER} Que nota tengo en Fisica? {TOK_LUMEN}",
+    f"{TOK_USER} Cuanto dura Ingenieria de Sistemas? {TOK_LUMEN}",
+    f"{TOK_USER} Como saco una constancia de matricula? {TOK_LUMEN}",
 ]
 
-def run_evaluation(model, tokenizer, step: int):
-    """Ejecuta la batería de prompts de evaluación."""
-    print(f"\n{'' * 60}")
-    print(f"  EVALUACIÓN — Paso {step:,}")
-    print(f"{'' * 60}")
 
-    for prompt in EVAL_PROMPTS[:5]:
-        response = generate(
-            model, tokenizer, prompt,
-            max_tokens=cfg.GEN_MAX_TOKENS,
-            temperature=cfg.GEN_TEMPERATURE,
-            top_k=cfg.GEN_TOP_K,
-            top_p=cfg.GEN_TOP_P,
-        )
+def run_evaluation(model, tokenizer, step):
+    print(f"\n{'=' * 60}")
+    print(f"  EVALUACION - Paso {step:,}")
+    print("=" * 60)
+    for prompt in EVAL_PROMPTS[:6]:
+        resp = generate(model, tokenizer, prompt,
+                        max_tokens=cfg.GEN_MAX_TOKENS,
+                        temperature=cfg.GEN_TEMPERATURE,
+                        top_k=cfg.GEN_TOP_K, top_p=cfg.GEN_TOP_P)
         q = prompt.split(TOK_USER)[-1].split(TOK_LUMEN)[0].strip()
-        print(f"\n   {q}")
-        print(f"   {response[:300]}")
-
-    print(f"\n{'' * 60}\n")
+        print(f"\n  Q: {q}")
+        print(f"  A: {resp[:300]}")
+    print(f"\n{'=' * 60}\n")
     model.train()
+
+
+# ═══════════════════════════════════════════════════════════
+#   CHECKPOINTS
+# ═══════════════════════════════════════════════════════════
 
 def save_checkpoint(model, optimizer, scaler, step, loss, path):
-    """Guarda un checkpoint del entrenamiento."""
-    checkpoint = {
-        "step": step,
-        "loss": loss,
-        "model_state_dict": model.state_dict(),
+    ckpt = {
+        "step": step, "loss": loss,
+        "model_state_dict":     model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
+        "scaler_state_dict":    scaler.state_dict(),
         "config": {
-            "vocab_size": tokenizer.get_piece_size(),
-            "d_model": cfg.D_MODEL,
-            "n_heads": cfg.N_HEADS,
-            "n_layers": cfg.N_LAYERS,
-            "d_ff": cfg.D_FF,
+            "vocab_size":  tokenizer.get_piece_size(),
+            "d_model":     cfg.D_MODEL, "n_heads": cfg.N_HEADS,
+            "n_layers":    cfg.N_LAYERS, "d_ff": cfg.D_FF,
             "max_seq_len": cfg.MAX_SEQ_LEN,
+            "special_tokens": dict(zip(
+                ["pad","bos","eos","user","lumen","end","think","endthink","call","result"],
+                SPECIAL_TOKENS
+            )),
         },
     }
-    torch.save(checkpoint, path)
-    print(f"   Checkpoint guardado: {path} (step {step:,}, loss {loss:.4f})")
-
+    torch.save(ckpt, path)
+    print(f"  [CKPT] {path.name} - paso {step:,}, loss {loss:.4f}")
     if USING_GDRIVE:
-        gdrive_path = cfg.GDRIVE_SAVE_DIR / path.name
-        torch.save(checkpoint, gdrive_path)
-        print(f"    Copia en Drive: {gdrive_path}")
+        torch.save(ckpt, cfg.GDRIVE_SAVE_DIR / path.name)
+        print(f"  [Drive] Guardado")
+
 
 def load_checkpoint(path, model, optimizer=None, scaler=None):
-    """Carga un checkpoint para continuar el entrenamiento."""
-    checkpoint = torch.load(path, map_location=DEVICE)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    if optimizer and "optimizer_state_dict" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    if scaler and "scaler_state_dict" in checkpoint:
-        scaler.load_state_dict(checkpoint["scaler_state_dict"])
-    print(f"   Checkpoint cargado: {path} (step {checkpoint['step']:,})")
-    return checkpoint["step"], checkpoint.get("loss", float("inf"))
+    ckpt = torch.load(path, map_location=DEVICE)
+    model.load_state_dict(ckpt["model_state_dict"])
+    if optimizer and "optimizer_state_dict" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    if scaler and "scaler_state_dict" in ckpt:
+        scaler.load_state_dict(ckpt["scaler_state_dict"])
+    print(f"  [CKPT] Reanudando desde {path.name} - paso {ckpt['step']:,}")
+    return ckpt["step"], ckpt.get("loss", float("inf"))
+
+
+# ═══════════════════════════════════════════════════════════
+#   LOOP DE ENTRENAMIENTO
+# ═══════════════════════════════════════════════════════════
 
 def train():
-    """Loop principal de entrenamiento."""
-    print("\n" + "" * 60)
-    print("  ¡INICIANDO ENTRENAMIENTO DE LUMEN!")
-    print("" * 60)
-    print(f"  Device: {DEVICE}")
-    print(f"  Batches por época: {len(dataloader):,}")
-    print(f"  Pasos totales: {cfg.MAX_STEPS:,}")
+    print("\n" + "=" * 60)
+    print("  INICIANDO ENTRENAMIENTO LUMEN v2.0")
+    print("=" * 60)
+    print(f"  Device: {DEVICE} | Pasos: {cfg.MAX_STEPS:,}")
     print(f"  Batch efectivo: {cfg.BATCH_SIZE * cfg.GRAD_ACCUM_STEPS}")
-    print("" * 60 + "\n")
+    print(f"  Response-only loss + Label Smoothing {cfg.LABEL_SMOOTHING}")
+    print("=" * 60 + "\n")
 
     model.train()
-    global_step = 0
-    running_loss = 0.0
-    best_loss = float("inf")
-    start_time = time.time()
-    tokens_processed = 0
+    global_step   = 0
+    running_loss  = 0.0
+    best_loss     = float("inf")
+    start_time    = time.time()
+    tok_processed = 0
     last_log_time = start_time
-    last_tokens = 0
+    last_tok      = 0
 
-    existing_ckpts = sorted(cfg.CHECKPOINT_DIR.glob("lumen_step_*.pt"),
-                            key=lambda p: int(p.stem.split("_")[-1]))
-
-    if not existing_ckpts and USING_GDRIVE:
+    # Resume desde checkpoint
+    existing = sorted(cfg.CHECKPOINT_DIR.glob("lumen_step_*.pt"),
+                      key=lambda p: int(p.stem.split("_")[-1]))
+    if not existing and USING_GDRIVE:
         gdrive_ckpts = sorted(cfg.GDRIVE_SAVE_DIR.glob("lumen_step_*.pt"),
                               key=lambda p: int(p.stem.split("_")[-1]))
         if gdrive_ckpts:
-            latest_gdrive = gdrive_ckpts[-1]
-            local_ckpt_path = cfg.CHECKPOINT_DIR / latest_gdrive.name
             import shutil
-            shutil.copy(str(latest_gdrive), str(local_ckpt_path))
-            existing_ckpts = [local_ckpt_path]
-            print(f"    Restaurado checkpoint desde Google Drive: {latest_gdrive.name}")
+            local = cfg.CHECKPOINT_DIR / gdrive_ckpts[-1].name
+            shutil.copy(str(gdrive_ckpts[-1]), str(local))
+            existing = [local]
+            print(f"  [Drive] Restaurado: {gdrive_ckpts[-1].name}")
 
-    if existing_ckpts:
-        latest = existing_ckpts[-1]
-        global_step, best_loss = load_checkpoint(latest, model, optimizer, scaler)
+    if existing:
+        global_step, best_loss = load_checkpoint(
+            existing[-1], model, optimizer, scaler)
         print(f"  Reanudando desde paso {global_step:,}\n")
 
     epoch = 0
     while global_step < cfg.MAX_STEPS:
         epoch += 1
-        for batch_idx, (x, y) in enumerate(dataloader):
+        for batch_idx, (x, y, resp_mask) in enumerate(dataloader):
             if global_step >= cfg.MAX_STEPS:
                 break
 
-            x = x.to(DEVICE, non_blocking=True)
-            y = y.to(DEVICE, non_blocking=True)
+            x         = x.to(DEVICE, non_blocking=True)
+            y         = y.to(DEVICE, non_blocking=True)
+            resp_mask = resp_mask.to(DEVICE, non_blocking=True)
 
             with autocast(dtype=torch.float16):
-                logits, loss = model(x, y)
-                loss = loss / cfg.GRAD_ACCUM_STEPS
+                _, loss = model(x, targets=y, response_mask=resp_mask)
+                loss    = loss / cfg.GRAD_ACCUM_STEPS
 
             scaler.scale(loss).backward()
-            tokens_processed += x.numel()
+            tok_processed += x.numel()
 
             if (batch_idx + 1) % cfg.GRAD_ACCUM_STEPS == 0:
                 scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
 
                 lr = get_lr(global_step, cfg.WARMUP_STEPS,
-                           cfg.MAX_STEPS, cfg.LEARNING_RATE)
+                            cfg.MAX_STEPS, cfg.LEARNING_RATE)
                 for pg in optimizer.param_groups:
                     pg["lr"] = lr
 
@@ -1510,196 +1641,174 @@ def train():
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
-                global_step += 1
+                global_step  += 1
                 running_loss += loss.item() * cfg.GRAD_ACCUM_STEPS
 
                 if global_step % cfg.LOG_EVERY == 0:
-                    avg_loss = running_loss / cfg.LOG_EVERY
-                    current_time = time.time()
-                    step_time = (current_time - last_log_time) / cfg.LOG_EVERY
-                    tok_per_sec = (tokens_processed - last_tokens) / (current_time - last_log_time)
-
-                    eta_seconds = (cfg.MAX_STEPS - global_step) * step_time
-                    eta_hours = eta_seconds / 3600
-
+                    avg_loss    = running_loss / cfg.LOG_EVERY
+                    now         = time.time()
+                    step_time   = (now - last_log_time) / cfg.LOG_EVERY
+                    tok_per_sec = (tok_processed - last_tok) / (now - last_log_time)
+                    eta_h       = (cfg.MAX_STEPS - global_step) * step_time / 3600
                     print(
                         f"  Paso {global_step:>6,}/{cfg.MAX_STEPS:,} | "
-                        f"Loss: {avg_loss:.4f} | "
-                        f"LR: {lr:.2e} | "
-                        f"Tok/s: {tok_per_sec:,.0f} | "
-                        f"Época: {epoch} | "
-                        f"ETA: {eta_hours:.1f}h"
+                        f"Loss: {avg_loss:.4f} | LR: {lr:.2e} | "
+                        f"Tok/s: {tok_per_sec:,.0f} | Epoca: {epoch} | ETA: {eta_h:.1f}h"
                     )
-                    running_loss = 0.0
-                    last_log_time = current_time
-                    last_tokens = tokens_processed
+                    running_loss  = 0.0
+                    last_log_time = now
+                    last_tok      = tok_processed
 
                 if global_step % cfg.EVAL_EVERY == 0:
                     run_evaluation(model, tokenizer, global_step)
                     model.train()
 
                 if global_step % cfg.SAVE_EVERY == 0:
-                    ckpt_path = cfg.CHECKPOINT_DIR / f"lumen_step_{global_step}.pt"
+                    ckpt_path    = cfg.CHECKPOINT_DIR / f"lumen_step_{global_step}.pt"
                     current_loss = loss.item() * cfg.GRAD_ACCUM_STEPS
                     save_checkpoint(model, optimizer, scaler,
-                                   global_step, current_loss, ckpt_path)
-
+                                    global_step, current_loss, ckpt_path)
                     if current_loss < best_loss:
                         best_loss = current_loss
-                        best_path = cfg.CHECKPOINT_DIR / "lumen_best.pt"
-                        save_checkpoint(model, optimizer, scaler,
-                                       global_step, current_loss, best_path)
+                        save_checkpoint(model, optimizer, scaler, global_step,
+                                        current_loss,
+                                        cfg.CHECKPOINT_DIR / "lumen_best.pt")
 
-        print(f"\n   Época {epoch} completada \n")
+        print(f"\n  Epoca {epoch} completada.\n")
 
-    total_time = time.time() - start_time
-    print("\n" + "" * 60)
-    print("   ENTRENAMIENTO COMPLETADO")
-    print("" * 60)
-    print(f"  Pasos totales: {global_step:,}")
-    print(f"  Tiempo total: {total_time/3600:.2f} horas")
-    print(f"  Mejor loss: {best_loss:.4f}")
-    print(f"  Tokens procesados: {tokens_processed:,}")
-    print("" * 60 + "\n")
-
+    total = time.time() - start_time
+    print("\n" + "=" * 60)
+    print("  ENTRENAMIENTO COMPLETADO")
+    print("=" * 60)
+    print(f"  Pasos: {global_step:,} | Tiempo: {total/3600:.2f}h")
+    print(f"  Mejor loss: {best_loss:.4f} | Tokens: {tok_processed:,}")
     return model
+
 
 trained_model = train()
 
-print("\n" + "" * 60)
-print("  EVALUACIÓN FINAL — TODOS LOS PROMPTS")
-print("" * 60)
+
+# ═══════════════════════════════════════════════════════════
+#   EVALUACION FINAL
+# ═══════════════════════════════════════════════════════════
+
+print("\n" + "=" * 60)
+print("  EVALUACION FINAL")
+print("=" * 60)
 
 for prompt in EVAL_PROMPTS:
-    response = generate(
-        trained_model, tokenizer, prompt,
-        max_tokens=cfg.GEN_MAX_TOKENS,
-        temperature=cfg.GEN_TEMPERATURE,
-        top_k=cfg.GEN_TOP_K,
-        top_p=cfg.GEN_TOP_P,
-    )
+    resp = generate(trained_model, tokenizer, prompt,
+                    max_tokens=cfg.GEN_MAX_TOKENS,
+                    temperature=cfg.GEN_TEMPERATURE,
+                    top_k=cfg.GEN_TOP_K, top_p=cfg.GEN_TOP_P)
     q = prompt.split(TOK_USER)[-1].split(TOK_LUMEN)[0].strip()
-    print(f"\n   {q}")
-    print(f"   {response[:500]}")
+    print(f"\n  Q: {q}")
+    print(f"  A: {resp[:500]}")
 
-print(f"\n{'' * 60}\n")
+
+# ═══════════════════════════════════════════════════════════
+#   EXPORTACION
+# ═══════════════════════════════════════════════════════════
 
 def export_model(model, tokenizer):
-    """Exporta el modelo final en formato safetensors + config."""
-    print("\n" + "" * 60)
+    print("\n" + "=" * 60)
     print("  EXPORTANDO MODELO FINAL")
-    print("" * 60)
+    print("=" * 60)
 
-    model_path = cfg.FINAL_MODEL_DIR / "lumen_model.pt"
-    torch.save(model.state_dict(), model_path)
-    size_mb = model_path.stat().st_size / 1e6
-    print(f"  [OK] Pesos PyTorch: {model_path} ({size_mb:.1f} MB)")
+    pt_path = cfg.FINAL_MODEL_DIR / "lumen_model.pt"
+    torch.save(model.state_dict(), pt_path)
+    print(f"  [OK] PyTorch: {pt_path} ({pt_path.stat().st_size/1e6:.1f} MB)")
 
     config = {
-        "model_name": "Lumen",
-        "version": "1.0.0",
+        "model_name": "Lumen", "version": "2.0.0",
         "creator": "Alessandro Villogas Gaspar",
         "organization": "Auralix Studio",
         "description": "Asistente IA on-device para Nexo / UPLA",
         "architecture": "decoder-only-transformer",
         "vocab_size": tokenizer.get_piece_size(),
-        "d_model": cfg.D_MODEL,
-        "n_heads": cfg.N_HEADS,
-        "n_layers": cfg.N_LAYERS,
-        "d_ff": cfg.D_FF,
+        "d_model": cfg.D_MODEL, "n_heads": cfg.N_HEADS,
+        "n_layers": cfg.N_LAYERS, "d_ff": cfg.D_FF,
         "max_seq_len": cfg.MAX_SEQ_LEN,
-        "special_tokens": {
-            "pad": TOK_PAD,
-            "bos": TOK_BOS,
-            "eos": TOK_EOS,
-            "user": TOK_USER,
-            "lumen": TOK_LUMEN,
-            "end": TOK_END,
+        "special_tokens": dict(zip(
+            ["pad","bos","eos","user","lumen","end","think","endthink","call","result"],
+            SPECIAL_TOKENS
+        )),
+        "features": {
+            "function_calling": True,
+            "thinking_mode": True,
+            "response_only_loss": True,
+            "label_smoothing": cfg.LABEL_SMOOTHING,
         },
         "training": {
             "steps": cfg.MAX_STEPS,
             "batch_size": cfg.BATCH_SIZE * cfg.GRAD_ACCUM_STEPS,
             "learning_rate": cfg.LEARNING_RATE,
+            "warmup_steps": cfg.WARMUP_STEPS,
             "wikipedia_docs": cfg.N_WIKIPEDIA_DOCS,
             "kb_repeat": cfg.KB_REPEAT,
         },
     }
-    config_path = cfg.FINAL_MODEL_DIR / "config.json"
-    config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False),
-                           encoding="utf-8")
-    print(f"  [OK] Configuración: {config_path}")
+    cfg_path = cfg.FINAL_MODEL_DIR / "config.json"
+    cfg_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"  [OK] Config: {cfg_path}")
 
     import shutil
-    sp_model = Path(str(cfg.TOKENIZER_PREFIX) + ".model")
-    sp_vocab = Path(str(cfg.TOKENIZER_PREFIX) + ".vocab")
-    if sp_model.exists():
-        shutil.copy2(sp_model, cfg.FINAL_MODEL_DIR / "tokenizer.model")
-        print(f"  [OK] Tokenizador: {cfg.FINAL_MODEL_DIR / 'tokenizer.model'}")
-    if sp_vocab.exists():
-        shutil.copy2(sp_vocab, cfg.FINAL_MODEL_DIR / "tokenizer.vocab")
+    for ext in [".model", ".vocab"]:
+        src = Path(str(cfg.TOKENIZER_PREFIX) + ext)
+        if src.exists():
+            dst = cfg.FINAL_MODEL_DIR / f"tokenizer{ext}"
+            shutil.copy2(src, dst)
+            print(f"  [OK] Tokenizador: {dst}")
 
     try:
         from safetensors.torch import save_model
         st_path = cfg.FINAL_MODEL_DIR / "lumen_model.safetensors"
         save_model(model, str(st_path))
-        st_mb = st_path.stat().st_size / 1e6
-        print(f"  [OK] SafeTensors: {st_path} ({st_mb:.1f} MB)")
+        print(f"  [OK] SafeTensors: {st_path} ({st_path.stat().st_size/1e6:.1f} MB)")
     except ImportError:
-        print("  [WARN] safetensors no disponible, solo se guardó formato .pt")
+        print("  [WARN] safetensors no disponible - solo se guardo .pt")
 
     if USING_GDRIVE:
-        import shutil
         dest = cfg.GDRIVE_SAVE_DIR / "lumen_final"
         if dest.exists():
             shutil.rmtree(dest)
         shutil.copytree(cfg.FINAL_MODEL_DIR, dest)
-        print(f"    Copia completa en Drive: {dest}")
+        print(f"  [Drive] Copia completa en {dest}")
 
-    print(f"\n{'' * 60}")
-    print("   MODELO EXPORTADO EXITOSAMENTE")
-    print(f"{'' * 60}")
-    print(f"\n   Archivos en: {cfg.FINAL_MODEL_DIR}")
-    print(f"  -> lumen_model.pt (pesos PyTorch)")
-    print(f"  -> lumen_model.safetensors (formato seguro)")
-    print(f"  -> config.json (arquitectura y metadatos)")
-    print(f"  -> tokenizer.model (SentencePiece)")
-    print(f"\n   Siguiente paso ")
-    print(f"  Para usar en Nexo, el modelo necesita ser convertido a")
-    print(f"  formato TFLite/MediaPipe. Esto se hace con las herramientas")
-    print(f"  de AI Edge Torch (google-ai-edge/ai-edge-torch).")
-    print(f"\n  Ejemplo:")
-    print(f"  $ pip install ai-edge-torch")
-    print(f"  $ python convert_to_tflite.py --model lumen_final/")
-    print()
+    print("\n" + "=" * 60)
+    print("  MODELO LUMEN v2.0 EXPORTADO")
+    print("=" * 60)
+    print(f"  -> lumen_model.safetensors")
+    print(f"  -> config.json")
+    print(f"  -> tokenizer.model")
+    print("  Siguiente: convertir a TFLite/MediaPipe con export_lumen.py")
+
 
 export_model(trained_model, tokenizer)
 
-def chat(model, tokenizer):
-    """Chat interactivo con Lumen para probar el modelo."""
-    print("\n" + "" * 60)
-    print("   CHAT CON LUMEN")
-    print("  Escribe tu mensaje. 'salir' para terminar.")
-    print("" * 60 + "\n")
 
+# ═══════════════════════════════════════════════════════════
+#   CHAT INTERACTIVO (opcional)
+# ═══════════════════════════════════════════════════════════
+
+def chat(model, tokenizer):
+    print("\n" + "=" * 60)
+    print("  CHAT CON LUMEN v2.0")
+    print("=" * 60 + "\n")
     while True:
         try:
-            user_input = input("   Tú: ").strip()
+            user_input = input("  Tu: ").strip()
         except (EOFError, KeyboardInterrupt):
             break
-
-        if not user_input or user_input.lower() in ("salir", "exit", "quit"):
-            print("\n  ¡Hasta luego! ")
+        if not user_input or user_input.lower() in ("salir", "exit"):
+            print("  Hasta luego!")
             break
+        resp = generate(model, tokenizer,
+                        f"{TOK_USER} {user_input} {TOK_LUMEN}",
+                        max_tokens=cfg.GEN_MAX_TOKENS,
+                        temperature=cfg.GEN_TEMPERATURE,
+                        top_k=cfg.GEN_TOP_K, top_p=cfg.GEN_TOP_P)
+        print(f"  Lumen: {resp}\n")
 
-        prompt = f"{TOK_USER} {user_input} {TOK_LUMEN}"
-        response = generate(
-            model, tokenizer, prompt,
-            max_tokens=cfg.GEN_MAX_TOKENS,
-            temperature=cfg.GEN_TEMPERATURE,
-            top_k=cfg.GEN_TOP_K,
-            top_p=cfg.GEN_TOP_P,
-        )
-        print(f"   Lumen: {response}\n")
 
-print("\n Script completado. El modelo Lumen ha sido entrenado y exportado.")
-print("   Para chatear interactivamente, ejecuta: chat(trained_model, tokenizer)")
+print("\n  Script completado. Para chatear: chat(trained_model, tokenizer)")
